@@ -6,7 +6,7 @@
 import torch
 import torch.nn as nn
 import numpy as np
-from typing import Tuple, Dict
+from typing import Tuple, Dict, Optional
 import matplotlib.pyplot as plt
 
 
@@ -205,14 +205,14 @@ class DRMLoss:
     """深度Ritz方法损失函数（修正版：经典 AT2，无 history）"""
 
     def __init__(self, E: float, nu: float, G_c: float, l: float,
-                 c_0: float = 8 / 3, k: float = 1e-6):
+                 c_0: float = 2 / 3, k: float = 1e-6):
         """
         Args:
             E: 杨氏模量
             nu: 泊松比
             G_c: 断裂能
             l: 长度尺度参数
-            c_0: 裂纹密度归一化常数 (默认 8/3 对应 w(d)=d²)
+            c_0: 裂纹密度归一化常数 (默认 2/3 对应 w(d)=d²)
             k: 残余刚度参数
         """
         self.E = E
@@ -222,8 +222,13 @@ class DRMLoss:
         self.c_0 = c_0
         self.k = k
 
-    def compute_energy_loss(self, x_domain: torch.Tensor, u_net: nn.Module,
-                            d_net: nn.Module) -> torch.Tensor:
+    def compute_energy_loss(
+            self,
+            x_domain: torch.Tensor,
+            u_net: nn.Module,
+            d_net: nn.Module,
+            d_prev: Optional[torch.Tensor] = None,  # ← 新增
+    ) -> torch.Tensor:
         """
         计算能量泛函损失（经典 AT2，无 history）
 
@@ -241,8 +246,28 @@ class DRMLoss:
         x_domain.requires_grad_(True)
 
         # 前向传播
-        u = u_net(x_domain)
-        d = d_net(x_domain)
+        # u = u_net(x_domain)
+        # d = d_net(x_domain)
+        """
+        计算 DRM 形式的总能量（AT2，无 history，但这里支持外部传入的 d_prev 做硬不可逆）
+        """
+        # 1) 位移场
+        u = u_net(x_domain)  # (N, 2)
+
+        # 2) 当前网络给出的损伤场
+        d_raw = d_net(x_domain)  # (N, 1)
+
+        # 3) 方案 B：如果提供了历史场，就做一次硬不可逆 clamp
+        if d_prev is not None:
+            # 确保在同一 device、同一形状
+            d_prev = d_prev.to(d_raw.device)
+            if d_prev.shape != d_raw.shape:
+                raise RuntimeError(
+                    f"d_prev shape {d_prev.shape} != d_raw shape {d_raw.shape}"
+                )
+            d = torch.max(d_raw, d_prev)
+        else:
+            d = d_raw
 
         # 应变和能量
         epsilon = compute_strain(u, x_domain)
@@ -262,16 +287,27 @@ class DRMLoss:
         # ✅ 弹性能：g(d) * ψ_plus + ψ_minus（张拉-压缩分裂，仅退化张拉部分）
         elastic_energy = g_d * psi_plus + psi_minus
 
+        # === AT1 nucleation threshold ===
+        psi_plus_clamped = torch.clamp(psi_plus, min=0.0)
+        threshold = self.G_c / self.l
+
+        # Prevent damage when below threshold
+        mask = (psi_plus_clamped < threshold).float()
+
+        # Equivalent to d=0 region (pinning)
+        d_effective = d * (1 - mask)
+        # Tanne 2018 - nucleation threshold
+
         # 裂纹能：(G_c/c_0) * (w(d)/l + l*|∇d|²)
-        crack_energy = (self.G_c / self.c_0) * (w_d / self.l + self.l * grad_d_norm_sq)
+        # crack_energy = (self.G_c / self.c_0) * (w_d / self.l + self.l * grad_d_norm_sq)
+        crack_energy = self.G_c * (d_effective / self.l + self.l * grad_d_norm_sq)
 
         # 总能量密度
         energy_density = elastic_energy + crack_energy
 
-        # 蒙特卡洛积分
-        loss = energy_density.mean()
+        loss_energy = (elastic_energy + 0.1 * crack_energy).mean()
 
-        return loss
+        return loss_energy
 
     def compute_bc_loss(self, x_bc: torch.Tensor, u_bc_true: torch.Tensor,
                         u_net: nn.Module, weight: float = 1.0) -> torch.Tensor:
@@ -345,7 +381,7 @@ class PhaseFieldSolver:
 
     def train_step(self, x_domain: torch.Tensor, x_bc: torch.Tensor,
                    u_bc: torch.Tensor, n_epochs: int = 1000,
-                   weight_bc: float = 100.0, weight_irrev: float = 0.0,  # ✅ 默认关闭不可逆性
+                   weight_bc: float = 100.0, weight_irrev: float = 0.1,  # ✅ 默认关闭不可逆性
                    verbose: bool = True):
         """
         单步训练（经典 AT2，无 history）
@@ -478,9 +514,9 @@ def visualize_solution(solver: PhaseFieldSolver,
         plt.savefig(save_path, dpi=150)
         print(f"Figure saved to {save_path}")
 
-    plt.show()
+    plt.close()
 
 
 if __name__ == "__main__":
     print("Phase-Field VPINN/DRM Solver Loaded Successfully!")
-    print("Use test_sent_fixed.py to run benchmark problems.")
+    print("This is a library module. Please run 'run_experiments.py' instead.")

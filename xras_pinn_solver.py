@@ -84,7 +84,9 @@ def compute_interface_loss(
     weight_trac: float = 1.0
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     # 保证有梯度，并且不污染外部变量
-    x = x_interface.clone().detach().requires_grad_(True)
+    x = x_interface.detach().clone()
+    x.requires_grad_(True)
+    # x = x_interface.clone().detach().requires_grad_(True)
 
     # 1. 在这里计算位移
     u1 = u_net_1(x)
@@ -92,6 +94,8 @@ def compute_interface_loss(
 
     # 2. 位移连续性
     L_u = weight_u * torch.mean((u1 - u2) ** 2)
+
+    scale = 1.0 / E if E > 1.0 else 1.0
 
     # 3. “牵引力连续性”的近似（用能量差）
     epsilon_1 = compute_strain(u1, x)
@@ -165,6 +169,12 @@ def resample(
     Returns:
         x_new: (N + N_add, 2) 更新后的采样点
     """
+
+    # ✅✅✅【修复】添加守卫语句：如果不需要加点，直接返回原点集
+    if N_add is None or N_add <= 0:
+        print(f"  [RAS] N_add <= 0 in resample({description}), 直接返回原点集.")
+        return x_current.clone()
+
     # ✅ 保证维度干净：x_current 是 (N, 2)，indicator_values 是 (N,)
     x_current = x_current.view(-1, 2)
     indicator_values = indicator_values.view(-1)
@@ -223,7 +233,7 @@ class XRASPINNLoss:
     """
 
     def __init__(self, E: float, nu: float, G_c: float, l: float,
-                 c_0: float = 8/3, k: float = 1e-6):
+                 c_0: float = 2/3, k: float = 1e-6):
         """
         Args:
             E: 杨氏模量
@@ -240,6 +250,60 @@ class XRASPINNLoss:
         self.c_0 = c_0
         self.k = k
 
+    def compute_irreversibility_loss(self,
+                                     x_subdomain: torch.Tensor,
+                                     d_net: nn.Module,
+                                     d_prev: torch.Tensor,
+                                     weight: float = 1.0) -> torch.Tensor:
+        """
+                不可逆性罚函数
+
+                说明：
+                - 理论上需要 d_prev 和 x_subdomain 一一对应；
+                - 但在 X-RAS + 动态域分解 / 自适应采样下，点集会变化，
+                  简单保存子域向量 d_prev_1 / d_prev_2 已经不足以保证对齐。
+                - 为了避免尺寸不匹配直接报错，这里做一个“安全降级”：
+                  若 d_prev 为 None 或尺寸与当前点集不一致，则返回 0。
+                """
+
+        # """不可逆性罚函数"""
+        # if d_prev is None:
+        #     return torch.tensor(0.0, device=x_subdomain.device)
+        # x = x_subdomain.detach()
+        # d_current = d_net(x)
+        # # 确保 d_prev 与 x_subdomain 对应 (这需要在 Solver 里处理好，或者这里假设 d_prev 已经切片好)
+        # # 简单起见，我们假设 d_prev 已经在 Solver 里被正确切片传入
+        # violation = torch.relu(d_prev.detach() - d_current)
+        # loss = weight * torch.mean(violation ** 2)
+        # return loss
+
+        device = x_subdomain.device
+
+        # 1) 没有历史场，直接返回 0
+        if d_prev is None:
+            return torch.tensor(0.0, device=device)
+
+        # 2) 计算当前损伤
+        x = x_subdomain.detach()
+        d_current = d_net(x)
+
+        # 3) 尺寸检查：如果长度不一致，说明当前子域点集和历史场不再一一对应
+        if d_prev.shape[0] != d_current.shape[0]:
+            # 打印一次 warning（你可以改成只在 verbose 时打印）
+            print(
+                f"  [Warning][Irreversibility] "
+                f"len(d_prev)={d_prev.shape[0]} != len(d_current)={d_current.shape[0]} "
+                f"→ skip irreversibility loss for this subdomain."
+            )
+            return torch.tensor(0.0, device=device)
+
+        # 4) 正常计算不可逆罚函数
+        violation = torch.relu(d_prev.detach() - d_current)
+        loss = weight * torch.mean(violation ** 2)
+        return loss
+
+
+
     def compute_subdomain_energy(
         self,
         x_subdomain: torch.Tensor,
@@ -251,7 +315,8 @@ class XRASPINNLoss:
 
         E[u,d] = ∫_Ω [g(d)·ψ⁺(ε) + ψ⁻(ε) + (G_c/c_0)(w(d)/l + l|∇d|²)] dΩ
         """
-        x = x_subdomain.clone().detach().requires_grad_(True)
+        x = x_subdomain.detach().clone()
+        x.requires_grad_(True)
 
         # 前向传播
         u = u_net(x)
@@ -273,7 +338,9 @@ class XRASPINNLoss:
         elastic_energy = g_d * psi_plus + psi_minus
 
         # 裂纹能
-        crack_energy = (self.G_c / self.c_0) * (w_d / self.l + self.l * grad_d_norm_sq)
+        # crack_energy = (self.G_c / self.c_0) * (w_d / self.l + self.l * grad_d_norm_sq)
+
+        crack_energy = self.G_c * (d ** 2 / (4 * self.l) + self.l * grad_d_norm_sq)
 
         # 总能量密度
         energy_density = elastic_energy + crack_energy
@@ -300,6 +367,7 @@ class XRASPINNLoss:
             mask_bc_1: 边界点属于子域1的掩码
             mask_bc_2: 边界点属于子域2的掩码
         """
+        x_bc = x_bc.detach()
         loss = 0.0
 
         if mask_bc_1.sum() > 0:
@@ -366,6 +434,80 @@ class XRASPINNSolver:
         self.current_phase = 0
         self.history = []
 
+        # ✅✅✅ 新增：初始化历史场变量
+        # ✅ 历史损伤场（不可逆约束用）
+        #   d_prev_field : 全域基准场，对应当前 x_domain
+        #   d_prev_1/2   : Ω_sing / Ω_far 上的切片（按当前训练使用的点集再切）
+        self.x_history = None
+        self.d_prev_field = None
+        self.d_prev_1 = None
+        self.d_prev_2 = None
+
+    # def set_history_field(self, x_domain: torch.Tensor, d_prev_field: torch.Tensor):
+    #     """
+    #     设置全域历史损伤场 d_prev(x)。
+    #
+    #     约定：
+    #     - x_domain 与 d_prev_field 一一对应（同样长度、同样顺序）。
+    #     - 不在此处做域分解，只存一份“全域基准场”。
+    #     - 当更换点集（例如 Phase-2 RAS 后的 x_domain_new）时，
+    #       需要在外部重新调用一次 set_history_field(x_domain_new, d_prev_new)。
+    #     """
+    #     x_domain = x_domain.detach().clone().to(self.device)
+    #     d_prev_field = d_prev_field.detach().clone().to(self.device)
+    #
+    #     self.x_history = x_domain
+    #     self.d_prev_field = d_prev_field
+    #
+    #     # 每次更新全域场时，子域切片作废，交给各 Phase 重新切
+    #     self.d_prev_1 = None
+    #     self.d_prev_2 = None
+    #
+    #     print(
+    #         f"  [X-RAS] History field set: "
+    #         f"N={x_domain.shape[0]}, "
+    #         f"d_prev ∈ [{d_prev_field.min().item():.3f}, {d_prev_field.max().item():.3f}]"
+    #     )
+
+    def set_history_field(self, x_domain: torch.Tensor, d_prev_field: torch.Tensor):
+        """
+        设置全域历史损伤场（core-only），用于不可逆约束。
+
+        设计原则：
+        - Phase-1 提供的 d_prev_field 与 x_domain 一一对应；
+        - 只在高损伤 core (d_prev >= thr_core) 上施加不可逆；
+        - 其余区域的 d_prev 视为 0，避免在裂纹外形成大面积平台。
+        """
+        thr_core = float(self.config.get("irrev_core_thr", 0.90))
+
+        with torch.no_grad():
+            # 1) 将点与历史场拷贝到当前设备
+            x_domain = x_domain.detach().clone().to(self.device)
+            d_prev = d_prev_field.detach().clone().reshape(-1, 1).to(self.device)
+
+            # 2) 只保留 core 区域的历史值，其余位置置零
+            core_mask = d_prev >= thr_core
+            d_prev_core = torch.zeros_like(d_prev)
+            d_prev_core[core_mask] = d_prev[core_mask]
+
+            # 3) 存成全域历史场；具体到子域的切分在各 Phase 内部完成
+            self.x_history = x_domain
+            self.d_prev_field = d_prev_core  # 注意：已经是 core-only
+            self.d_prev_1 = None
+            self.d_prev_2 = None
+            self.history_field_set = True
+
+        print(
+            "[X-RAS] History field set (core-only): "
+            "N={}, thr={:.2f}, core_pts={}, d_prev ∈ [{:.3f}, {:.3f}]".format(
+                x_domain.shape[0],
+                thr_core,
+                int(core_mask.sum().item()),
+                float(d_prev.min().item()),
+                float(d_prev.max().item()),
+            )
+        )
+
     def _move_models_to_device(self):
         """将所有模型移动到设备"""
         self.models.u_net_1.to(self.device)
@@ -390,22 +532,89 @@ class XRASPINNSolver:
         self.optimizer_d2 = torch.optim.Adam(
             self.models.d_net_2.parameters(), lr=lr_d)
 
-    def partition_points(
+    # def partition_points(
+    #     self, x: torch.Tensor
+    # ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    #     """
+    #     划分点集
+    #
+    #     Returns:
+    #         x_sing: 奇异区点
+    #         x_far: 远场点
+    #         mask_sing: 奇异区掩码
+    #         mask_far: 远场掩码
+    #     """
+    #     mask_sing, mask_far = partition_domain(x, self.crack_center, self.r_sing)
+    #     x_sing = x[mask_sing]
+    #     x_far = x[mask_far]
+    #     return x_sing, x_far, mask_sing, mask_far
+
+    # -------------------- PATCH 1: 动态 Ω_sing 支持 --------------------
+    def _partition_points_static(
         self, x: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        划分点集
-
-        Returns:
-            x_sing: 奇异区点
-            x_far: 远场点
-            mask_sing: 奇异区掩码
-            mask_far: 远场掩码
+        静态划分：以裂纹中心 + r_sing 的圆作为奇异区
+        （保留原逻辑，方便消融/回退）
         """
         mask_sing, mask_far = partition_domain(x, self.crack_center, self.r_sing)
         x_sing = x[mask_sing]
         x_far = x[mask_far]
         return x_sing, x_far, mask_sing, mask_far
+
+    def _partition_points_dynamic(
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        动态划分：基于当前损伤场 d(x) 的“裂尖窗口”
+
+        规则：
+          d_min < d(x) < d_max  视为 Ω_sing
+          其他视为 Ω_far
+
+        如果当前训练还很早，导致窗口内点太少，则自动回退到静态圆形划分。
+        """
+        # 配置中的窗口参数
+        d_min = float(self.config.get("dynamic_sing_d_min", 0.10))
+        d_max = float(self.config.get("dynamic_sing_d_max", 0.60))
+
+        # 当前损伤场（用 Ω_sing 网络的 d_net_1 估计）
+        with torch.no_grad():
+            x_dev = x.to(self.device)
+            d_vals = self.models.d_net_1(x_dev).squeeze()
+
+        # 防止维度问题
+        if d_vals.ndim > 1:
+            d_vals = d_vals[..., 0]
+
+        mask_sing = (d_vals > d_min) & (d_vals < d_max)
+        n_sing = int(mask_sing.sum().item())
+
+        # 安全保护：点太少就回退到静态划分
+        min_points = self.config.get("dynamic_sing_min_points", 200)
+        if n_sing < min_points:
+            # 回退到原来的圆形划分
+            return self._partition_points_static(x)
+
+        mask_sing = mask_sing.cpu()
+        mask_far = ~mask_sing
+
+        x_sing = x[mask_sing]
+        x_far = x[mask_far]
+        return x_sing, x_far, mask_sing, mask_far
+
+    def partition_points(
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        总接口：根据 config 决定使用静态还是动态 Ω_sing
+        """
+        use_dynamic = bool(self.config.get("use_dynamic_sing", True))
+        if use_dynamic:
+            return self._partition_points_dynamic(x)
+        else:
+            return self._partition_points_static(x)
+    # ------------------ PATCH 1 结束 ------------------
 
     def get_interface_points(
         self, x_domain: torch.Tensor, n_interface: int = 200
@@ -448,8 +657,16 @@ class XRASPINNSolver:
         u_bc = u_bc.to(self.device)
 
         # 划分域
-        x_sing, x_far, _, _ = self.partition_points(x_domain)
+        x_sing, x_far, mask_sing, mask_far = self.partition_points(x_domain)
         mask_bc_sing, mask_bc_far = partition_domain(x_bc, self.crack_center, self.r_sing)
+
+        # ✅ 根据当前点集，同步历史场切片
+        if self.d_prev_field is not None:
+            self.d_prev_1 = self.d_prev_field[mask_sing]
+            self.d_prev_2 = self.d_prev_field[mask_far]
+        else:
+            self.d_prev_1 = None
+            self.d_prev_2 = None
 
         print(f"  Domain partition: Ω_sing={x_sing.shape[0]}, Ω_far={x_far.shape[0]}")
         print(f"  BC partition: BC_sing={mask_bc_sing.sum()}, BC_far={mask_bc_far.sum()}")
@@ -478,11 +695,16 @@ class XRASPINNSolver:
                 weight_bc
             )
 
-            # 总损失 (无接口项)
-            loss = L_energy_1 + L_energy_2 + L_bc
+            # 不可逆损失
+            L_irrev_1 = self.loss_fn.compute_irreversibility_loss(
+                x_sing, self.models.d_net_1, self.d_prev_1, weight=1000.0)
+            L_irrev_2 = self.loss_fn.compute_irreversibility_loss(
+                x_far, self.models.d_net_2, self.d_prev_2, weight=1000.0)
 
+            # 总损失
+            loss = L_energy_1 + L_energy_2 + L_bc + L_irrev_1 + L_irrev_2
             # 反向传播
-            loss.backward()
+            loss.backward(retain_graph=True)
             self.optimizer_u1.step()
             self.optimizer_d1.step()
             self.optimizer_u2.step()
@@ -531,8 +753,16 @@ class XRASPINNSolver:
         print(f"  Interface points: {x_interface.shape[0]}")
 
         # 划分域
-        x_sing, x_far, _, _ = self.partition_points(x_domain)
+        x_sing, x_far, mask_sing, mask_far = self.partition_points(x_domain)
         mask_bc_sing, mask_bc_far = partition_domain(x_bc, self.crack_center, self.r_sing)
+
+        # ✅ 同步历史场切片
+        if self.d_prev_field is not None:
+            self.d_prev_1 = self.d_prev_field[mask_sing]
+            self.d_prev_2 = self.d_prev_field[mask_far]
+        else:
+            self.d_prev_1 = None
+            self.d_prev_2 = None
 
         # 训练
         for epoch in range(n_epochs):
@@ -565,8 +795,14 @@ class XRASPINNSolver:
             )
             L_interface = weight_interface * (L_u + L_trac)
 
+            # 不可逆损失
+            L_irrev_1 = self.loss_fn.compute_irreversibility_loss(
+                x_sing, self.models.d_net_1, self.d_prev_1, weight=150.0)
+            L_irrev_2 = self.loss_fn.compute_irreversibility_loss(
+                x_far, self.models.d_net_2, self.d_prev_2, weight=150.0)
+
             # 总损失
-            loss = L_energy_1 + L_energy_2 + L_bc + L_interface
+            loss = L_energy_1 + L_energy_2 + L_bc + L_interface + L_irrev_1 + L_irrev_2
 
             # 反向传播
             loss.backward()
@@ -582,15 +818,27 @@ class XRASPINNSolver:
                       f"L_u: {L_u.item():.6e} | L_trac: {L_trac.item():.6e}")
 
         # 自适应采样 (Algorithm 2, line 11-12)
+
+        if N_add is None or N_add <= 0:
+            print("\n  ⚠️ 自适应采样已禁用 (N_add <= 0)，跳过重采样，保持原始网格.")
+            print("  Phase 2 完成!")
+            # 保持和后续接口一致，返回一个“新网格”
+            return x_domain.detach().clone()
+
         print("\n  Computing indicators for adaptive sampling...")
 
-            # 在奇异区计算指标 (裂纹区更需要加密)
+        # 确保在计算 Indicator 之前对输入点进行 detach()，防止梯度错误
+        x_sing_detached = x_sing.detach()
+        x_far_detached = x_far.detach()
+
+        # 在奇异区计算指标 (裂纹区更需要加密)
+        # 注意：compute_indicator 内部已经会克隆并 requires_grad_(True)
         indicator_sing = compute_indicator(
-            x_sing, self.models.u_net_1, self.models.d_net_1,
+            x_sing_detached, self.models.u_net_1, self.models.d_net_1,
             self.E, self.nu, beta
         )
         indicator_far = compute_indicator(
-            x_far, self.models.u_net_2, self.models.d_net_2,
+            x_far_detached, self.models.u_net_2, self.models.d_net_2,
             self.E, self.nu, beta
         )
         # 重采样
@@ -615,8 +863,9 @@ class XRASPINNSolver:
         print(f"    Ω_far: {x_far.shape[0]} → {x_far_new.shape[0]}")
 
         # 可视化指标分布
-        self._visualize_indicator(x_domain,
-                                  torch.cat([indicator_sing.cpu(), indicator_far.cpu()]))
+        # 修复：确保传入的是 CPU 上 detach 的张量
+        self._visualize_indicator(x_domain.cpu(),
+                                  torch.cat([indicator_sing.detach().cpu(), indicator_far.detach().cpu()]))
 
         print("  Phase 2 完成!")
 
@@ -651,8 +900,16 @@ class XRASPINNSolver:
         x_interface = self.get_interface_points(x_domain, n_interface).to(self.device)
 
         # 划分域
-        x_sing, x_far, _, _ = self.partition_points(x_domain)
+        x_sing, x_far, mask_sing, mask_far = self.partition_points(x_domain)
         mask_bc_sing, mask_bc_far = partition_domain(x_bc, self.crack_center, self.r_sing)
+
+        # ✅ 在加密后的点集上重新切历史场
+        if self.d_prev_field is not None:
+            self.d_prev_1 = self.d_prev_field[mask_sing]
+            self.d_prev_2 = self.d_prev_field[mask_far]
+        else:
+            self.d_prev_1 = None
+            self.d_prev_2 = None
 
         print(f"  Final grid: Ω_sing={x_sing.shape[0]}, Ω_far={x_far.shape[0]}")
 
@@ -688,8 +945,15 @@ class XRASPINNSolver:
                 self.nu
             )
             L_interface = weight_interface * (L_u + L_trac)
+
+            # 不可逆损失
+            L_irrev_1 = self.loss_fn.compute_irreversibility_loss(
+                x_sing, self.models.d_net_1, self.d_prev_1, weight=150.0)
+            L_irrev_2 = self.loss_fn.compute_irreversibility_loss(
+                x_far, self.models.d_net_2, self.d_prev_2, weight=150.0)
+
             # 总损失
-            loss = L_energy_1 + L_energy_2 + L_bc + L_interface
+            loss = L_energy_1 + L_energy_2 + L_bc + L_interface ++ L_irrev_1 + L_irrev_2
 
             # 反向传播
             loss.backward()

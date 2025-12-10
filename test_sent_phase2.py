@@ -19,6 +19,10 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 from pathlib import Path
+from fe_baseline_utils import (
+    compare_fe_pinn_midline,
+    plot_fe_vs_pinn_midline,
+)
 
 # ============================================================================
 # §1 路径与导入
@@ -44,6 +48,18 @@ from xras_pinn_solver import (
 )
 
 from config import create_config, print_config
+
+# 导入 Phase-1 桥接模块
+try:
+    from phase1_phase2_bridge import (
+        load_phase1_checkpoint,
+        setup_phase2_from_phase1,
+        initialize_network_from_field
+    )
+    BRIDGE_AVAILABLE = True
+except ImportError:
+    print("⚠️  警告: phase1_phase2_bridge.py 未找到，Phase-1 集成功能不可用")
+    BRIDGE_AVAILABLE = False
 
 # ============================================================================
 # §2 统一的采样点生成（与Phase-1一致）
@@ -208,9 +224,19 @@ def get_bc_function_sent(config):
 # §3 训练函数：VPINN baseline
 # ============================================================================
 
-def run_vpinn_baseline(config, x_domain, x_bc, u_bc):
+def run_vpinn_baseline(config, x_domain, x_bc, u_bc, 
+                       from_phase1=False, phase1_checkpoint=None,
+                       d_prev_field=None): # ✅ 接收 d_prev_field):
     """
     训练单域VPINN作为baseline
+    
+    Args:
+        config: 配置字典
+        x_domain: 域内采样点
+        x_bc: 边界采样点  
+        u_bc: 边界条件
+        from_phase1: 是否从 Phase-1 初始化
+        phase1_checkpoint: Phase-1 检查点（如果 from_phase1=True）
 
     Returns:
         solver: 训练好的求解器
@@ -224,24 +250,83 @@ def run_vpinn_baseline(config, x_domain, x_bc, u_bc):
     u_net = DisplacementNetwork()
     d_net = DamageNetwork()
 
-    # 2. Notch初始化
-    print("\n  [1/3] Notch损伤种子初始化...")
-    d_net = initialize_notch_damage(d_net, x_domain, config)
+    # 2. 根据模式选择初始化策略
+    if from_phase1 and phase1_checkpoint is not None:
+        print("\n  [1/3] 从 Phase-1 初始化...")
+        
+        # 从 Phase-1 加载网络并初始化
+        u_net_phase1 = DisplacementNetwork()
+        d_net_phase1 = DamageNetwork()
+        
+        u_net_phase1.load_state_dict(phase1_checkpoint['u_net_state_dict'])
+        d_net_phase1.load_state_dict(phase1_checkpoint['d_net_state_dict'])
+        
+        u_net_phase1.eval()
+        d_net_phase1.eval()
+        
+        # 生成目标场
+        with torch.no_grad():
+            u_field = u_net_phase1(x_domain)
+            d_field = d_net_phase1(x_domain)
+        
+        print(f"    Phase-1 场统计:")
+        print(f"      u: mean={u_field.mean().item():.4e}, max={u_field.abs().max().item():.4e}")
+        print(f"      d: mean={d_field.mean().item():.4f}, max={d_field.max().item():.4f}")
+        
+        # 初始化 Phase-2 网络
+        field_init_epochs = config.get('field_init_epochs', 500)
+        
+        print(f"    初始化位移网络...")
+        initialize_network_from_field(u_net, x_domain, u_field, 
+                                      n_epochs=field_init_epochs, verbose=False)
+        
+        print(f"    初始化损伤网络...")
+        initialize_network_from_field(d_net, x_domain, d_field,
+                                      n_epochs=field_init_epochs, verbose=False)
+        
+        # 验证初始化质量
+        with torch.no_grad():
+            u_init = u_net(x_domain)
+            d_init = d_net(x_domain)
+            u_error = torch.mean((u_init - u_field)**2).sqrt().item()
+            d_error = torch.mean((d_init - d_field)**2).sqrt().item()
+        
+        print(f"    初始化质量: u_RMSE={u_error:.4e}, d_RMSE={d_error:.4e}")
+        
+    else:
+        print("\n  [1/3] Notch损伤种子初始化...")
+        d_net = initialize_notch_damage(d_net, x_domain, config)
 
     # 3. 构建求解器
     solver = PhaseFieldSolver(config, u_net, d_net)
 
+    # ✅ 关键：设置 solver 的 d_prev，启用不可逆约束
+    if from_phase1 and d_prev_field is not None:
+        solver.d_prev = d_prev_field.to(config['device'])
+        print(f"  [不可逆约束] 已设置 d_prev (max={d_prev_field.max():.3f})")
+
     # 4. 训练
-    print(f"\n  [2/3] 训练VPINN ({config['n_epochs_vpinn']} epochs)...")
+    if from_phase1:
+        # 从 Phase-1 继续训练，用较少的 epoch 精细化
+        n_epochs_train = config.get('phase2_refine_epochs', 500)
+        print(f"\n  [2/3] 精细化训练 VPINN ({n_epochs_train} epochs)...")
+        # ✅ 强制启用强不可逆约束 (覆盖 config 中的 0.0)
+        weight_irrev = 1000.0  # 强约束
+    else:
+        # 从头训练
+        weight_irrev = 0.0
+        n_epochs_train = config['n_epochs_vpinn']
+        print(f"\n  [2/3] 训练 VPINN ({n_epochs_train} epochs)...")
+    
     t0 = time.time()
 
     solver.train_step(
         x_domain,
         x_bc,
         u_bc,
-        n_epochs=config["n_epochs_vpinn"],
-        weight_bc=config["weight_bc"],
-        weight_irrev=config["weight_irrev"],
+        n_epochs=n_epochs_train,
+        weight_bc=config.get("weight_bc", 200.0),
+        weight_irrev = weight_irrev,
         verbose=False  # 减少日志输出
     )
 
@@ -267,9 +352,24 @@ def run_vpinn_baseline(config, x_domain, x_bc, u_bc):
 # §4 训练函数：X-RAS-PINN
 # ============================================================================
 
-def run_xras_solver(config, x_domain, x_bc, u_bc):
+def run_xras_solver(config, x_domain, x_bc, u_bc,
+                   from_phase1=False, phase1_checkpoint=None,
+                   d_prev_field=None):
     """
     训练X-RAS-PINN（域分解 + 自适应采样）
+    
+    支持消融实验:
+    - use_partition: 是否使用域分解
+    - use_ras: 是否使用自适应采样
+    - use_interface_loss: 是否使用接口损失
+    
+    Args:
+        config: 配置字典
+        x_domain: 域内采样点
+        x_bc: 边界采样点
+        u_bc: 边界条件
+        from_phase1: 是否从 Phase-1 初始化
+        phase1_checkpoint: Phase-1 检查点
 
     Returns:
         solver: 训练好的求解器
@@ -279,6 +379,20 @@ def run_xras_solver(config, x_domain, x_bc, u_bc):
     print("\n" + "="*70)
     print("  [X-RAS-PINN] 开始训练")
     print("="*70)
+    
+    # 读取实验控制开关
+    use_partition = config.get("use_partition", True)
+    use_ras = config.get("use_ras", True)
+    use_interface_loss = config.get("use_interface_loss", True)
+
+    # ✅ 读取 indicator_beta
+    indicator_beta = config.get("indicator_beta", 0.6)
+
+    print(f"  实验配置:")
+    print(f"    域分解: {'ON' if use_partition else 'OFF'}")
+    print(f"    自适应采样: {'ON' if use_ras else 'OFF'}")
+    print(f"    Indicator Beta (β): {indicator_beta:.2f}")  # ✅ 打印 Beta 值
+    print(f"    从 Phase-1 初始化: {'ON' if from_phase1 else 'OFF'}")
 
     # 1. 初始化子域网络
     u_net_1 = DisplacementNetwork()
@@ -286,9 +400,55 @@ def run_xras_solver(config, x_domain, x_bc, u_bc):
     u_net_2 = DisplacementNetwork()
     d_net_2 = DamageNetwork()
 
-    # 2. 只对Ω_sing的d_net_1做notch初始化
-    print("\n  [1/4] Notch初始化（仅Ω_sing网络）...")
-    d_net_1 = initialize_notch_damage(d_net_1, x_domain, config)
+    # 2. 初始化策略
+    if from_phase1 and phase1_checkpoint is not None:
+        print("\n  [1/4] 从 Phase-1 初始化...")
+        
+        # 从 Phase-1 加载网络
+        u_net_phase1 = DisplacementNetwork()
+        d_net_phase1 = DamageNetwork()
+        
+        u_net_phase1.load_state_dict(phase1_checkpoint['u_net_state_dict'])
+        d_net_phase1.load_state_dict(phase1_checkpoint['d_net_state_dict'])
+        
+        u_net_phase1.eval()
+        d_net_phase1.eval()
+        
+        # 生成目标场
+        with torch.no_grad():
+            u_field = u_net_phase1(x_domain)
+            d_field = d_net_phase1(x_domain)
+        
+        print(f"    Phase-1 场统计:")
+        print(f"      d: mean={d_field.mean().item():.4f}, max={d_field.max().item():.4f}")
+        
+        # 初始化所有子域网络
+        field_init_epochs = config.get('field_init_epochs', 300)
+        
+        print(f"    初始化 Ω_sing 网络...")
+        initialize_network_from_field(u_net_1, x_domain, u_field, 
+                                      n_epochs=field_init_epochs, verbose=False)
+        initialize_network_from_field(d_net_1, x_domain, d_field,
+                                      n_epochs=field_init_epochs, verbose=False)
+        
+        print(f"    初始化 Ω_far 网络...")
+        initialize_network_from_field(u_net_2, x_domain, u_field,
+                                      n_epochs=field_init_epochs, verbose=False)
+        initialize_network_from_field(d_net_2, x_domain, d_field,
+                                      n_epochs=field_init_epochs, verbose=False)
+        
+        # 验证初始化质量
+        with torch.no_grad():
+            d_init_1 = d_net_1(x_domain)
+            d_init_2 = d_net_2(x_domain)
+            d_error_1 = torch.mean((d_init_1 - d_field)**2).sqrt().item()
+            d_error_2 = torch.mean((d_init_2 - d_field)**2).sqrt().item()
+        
+        print(f"    初始化质量: d_RMSE_1={d_error_1:.4e}, d_RMSE_2={d_error_2:.4e}")
+        
+    else:
+        print("\n  [1/4] Notch初始化（仅Ω_sing网络）...")
+        d_net_1 = initialize_notch_damage(d_net_1, x_domain, config)
 
     models = SubdomainModels(
         u_net_1=u_net_1,
@@ -298,47 +458,101 @@ def run_xras_solver(config, x_domain, x_bc, u_bc):
     )
 
     # 3. 构建X-RAS求解器
-    crack_center = torch.tensor(config["notch_tip"])
+    crack_center = torch.tensor([config["notch_length"], config["H"] / 2.0])
     r_sing = config["r_sing"]
 
     solver = XRASPINNSolver(config, models, crack_center, r_sing=r_sing)
 
+    # ✅✅✅ 关键修改：将历史场传递给 solver，启用不可逆约束
+    if from_phase1 and d_prev_field is not None:
+        # 这里我们需要再次提取 d_prev_field，或者作为参数传进来
+        # 既然 run_xras_solver 没有接收 d_prev_field 参数，我们得加上
+        solver.set_history_field(x_domain, d_prev_field)
+
+    # ✅ 根据消融开关调整接口损失权重
+    if not use_interface_loss:
+        print("  ⚠️  接口损失已禁用")
+        original_weight = config["weight_interface"]
+        config["weight_interface"] = 0.0
+
     # 4. 三阶段训练
     t0 = time.time()
+    
+    # 根据是否从 Phase-1 初始化调整训练策略
+    if from_phase1:
+        # 从 Phase-1 继续：减少 Phase 1 的 epoch，增加 Phase 2/3
+        phase1_epochs = config["n_epochs_phase1"] // 2
+        phase2_epochs = config["n_epochs_phase2"]
+        phase3_epochs = config["n_epochs_phase3"]
+        print(f"\n  训练策略（从 Phase-1 继续）:")
+        print(f"    Phase 1: {phase1_epochs} epochs (减半)")
+        print(f"    Phase 2: {phase2_epochs} epochs")
+        print(f"    Phase 3: {phase3_epochs} epochs")
+    else:
+        # 从头训练：使用标准配置
+        phase1_epochs = config["n_epochs_phase1"]
+        phase2_epochs = config["n_epochs_phase2"]
+        phase3_epochs = config["n_epochs_phase3"]
 
     # Phase 1: 预训练
-    print(f"\n  [2/4] Phase 1: 预训练 ({config['n_epochs_phase1']} epochs)...")
+    print(f"\n  [2/4] Phase 1: 预训练 ({phase1_epochs} epochs)...")
     solver.train_phase1_pretrain(
         x_domain,
         x_bc,
         u_bc,
-        n_epochs=config["n_epochs_phase1"],
-        weight_bc=config["weight_bc"],
+        n_epochs=phase1_epochs,
+        weight_bc=config.get("weight_bc", 200.0),
         verbose=False
     )
 
     # Phase 2: 聚焦 + 自适应采样
-    print(f"\n  [3/4] Phase 2: 聚焦训练 + RAS ({config['n_epochs_phase2']} epochs)...")
+    print(f"\n  [3/4] Phase 2: 聚焦训练 + RAS ({phase2_epochs} epochs)...")
+    
+    # ✅ 根据 use_ras 开关决定是否添加点
+    N_add_actual = config["N_add_ras"] if use_ras else 0
+    if not use_ras:
+        print("  ⚠️  自适应采样已禁用，不增加新点")
+    
     x_domain_new = solver.train_phase2_focused(
         x_domain,
         x_bc,
         u_bc,
-        n_epochs=config["n_epochs_phase2"],
-        weight_bc=config["weight_bc"],
+        n_epochs=phase2_epochs,
+        weight_bc=config.get("weight_bc", 200.0),
         weight_interface=config["weight_interface"],
-        N_add=config["N_add_ras"],
+        N_add=N_add_actual,
+        beta=indicator_beta,  # ✅ 传入 indicator_beta 参数
         verbose=False
     )
 
+    # 1. 切断计算图
+    x_domain_new = x_domain_new.detach()
+    # 2. 如果启用了Phase - 1约束，必须为新网格计算对应的d_prev
+    if from_phase1 and phase1_checkpoint is not None:
+        print(f"\n  [Info] 网格已更新 ({x_domain.shape[0]} -> {x_domain_new.shape[0]})，正在更新历史场...")
+
+        # 临时重新加载 Phase-1 网络
+        temp_d_net = DamageNetwork()
+        temp_d_net.load_state_dict(phase1_checkpoint['d_net_state_dict'])
+        temp_d_net.eval()
+
+        with torch.no_grad():
+            # 对新网格 (x_domain_new) 进行预测
+            # 这确保了新加的点也有正确的历史约束值，而不是 0
+            d_prev_new = temp_d_net(x_domain_new).detach()
+
+        # 调用 Solver 的方法更新内部状态
+        solver.set_history_field(x_domain_new, d_prev_new)
+
     # Phase 3: 联合微调
-    print(f"\n  [4/4] Phase 3: 联合微调 ({config['n_epochs_phase3']} epochs)...")
+    print(f"\n  [4/4] Phase 3: 联合微调 ({phase3_epochs} epochs)...")
     solver.train_phase3_joint_finetune(
         x_domain_new,
         x_bc,
         u_bc,
-        n_epochs=config["n_epochs_phase3"],
-        n_interface=config["n_interface"],
-        weight_bc=config["weight_bc"],
+        n_epochs=phase3_epochs,
+        n_interface=config.get("n_interface", 100),
+        weight_bc=config.get("weight_bc", 200.0),
         weight_interface=config["weight_interface"],
         verbose=False
     )
@@ -374,7 +588,8 @@ def visualize_comparison(
     x_domain_xras,
     time_vpinn,
     time_xras,
-    output_dir
+    output_dir,
+    exp_name: str = "Baseline"
 ):
     """
     生成论文级对比图像
@@ -411,10 +626,10 @@ def visualize_comparison(
     x_flat = x_grid[:, 0].cpu().numpy()
     y_flat = x_grid[:, 1].cpu().numpy()
     pts = np.stack([x_flat, y_flat], axis=1)
-    crack_center = np.array(config["notch_tip"])
+    crack_center = np.array([config["notch_length"], config["H"] / 2.0])
     dist = np.linalg.norm(pts - crack_center, axis=1)
 
-    r_near = 0.1
+    r_near = config.get("r_near", 0.1)  # 从 config 读取近场半径
     mask_near = dist < r_near
 
     d_v_flat = d_vpinn.reshape(-1)
@@ -573,8 +788,10 @@ def visualize_comparison(
     ax9.set_title("Quantitative Metrics", fontsize=12, fontweight='bold', pad=20)
 
     # 保存
-    save_path = output_dir / "sent_phase2_comparison.png"
+    safe_name = exp_name.replace('-', '_').replace(' ', '')  # ✅ 清理名称
+    save_path = output_dir / f"sent_phase2_comparison_{safe_name}.png" # ✅ 使用 exp_name 构造路径
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
+
     plt.close()
 
     print(f"    ✓ 对比图已保存: {save_path}")
@@ -593,14 +810,21 @@ def visualize_comparison(
 # §6 主测试函数
 # ============================================================================
 
-def test_sent_phase2(debug=True):
+def test_sent_phase2(debug=True, input_config=None, exp_name="Baseline", fe_path=None):
     """
     主测试：SENT + notch 上的 VPINN vs X-RAS-PINN 完整对比
 
     Args:
         debug: True=快速测试, False=精细实验
+        input_config: 外部传入的配置字典 (用于消融/参数扫描)
     """
     output_dir = get_output_dir()
+
+    if fe_path is None:
+        BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+        fe_path = os.path.join(BASE_DIR, "data", "fe_sent_phasefield.npz")
+
+        print("[FE] Using baseline file:", fe_path)
 
     print("\n" + "="*70)
     print("  SENT Phase-2: VPINN vs X-RAS-PINN 对比实验")
@@ -609,15 +833,59 @@ def test_sent_phase2(debug=True):
 
     # 1. 加载统一配置
     print("[1/6] 加载统一配置...")
-    config = create_config(debug=debug)
+    # ✅ 优先使用外部传入的配置
+    if input_config is not None:
+        config = input_config
+        # 确保 debug 模式标志与传入的配置匹配
+        print(f"  ✓ 外部配置已加载 ({'DEBUG' if debug else 'FULL'})")
+    else:
+        # 如果没有外部配置，则根据 debug 标志创建新配置
+        config = create_config(debug=debug)
+
     print_config(config)
 
     # 2. 生成采样点
     print("[2/6] 生成SENT采样点...")
-    torch.manual_seed(42)  # 固定随机种子
-    np.random.seed(42)
+    torch.manual_seed(config["seed"])  # 固定随机种子
+    np.random.seed(config["seed"])
 
-    x_domain, x_bc = generate_sent_with_notch_points(config)
+    # ✅ 预算模式逻辑：统一控制 VPINN 和 X-RAS 的基础点数
+    N_base = config["n_domain"]
+
+    config_vpinn = config.copy()
+    config_xras = config.copy()
+
+    # ✅ 预算模式逻辑：如果开启，调整基础点数
+    if config["budget_mode"]:
+        # --- 预算模式（固定总点数）---
+        N_total_budget = N_base
+        N_add = config["N_add_ras"]
+
+        # 1. X-RAS 基础点数：总预算 - RAS增加点数
+        N_xras_base = max(N_total_budget - N_add, 500)  # 确保至少 500 个基础点
+
+        # 2. VPINN 点数：使用总预算点数
+        N_vpinn_base = N_total_budget
+
+        print(f"  ✓ 预算模式开启: 总点数预算 = {N_total_budget} 点")
+        print(f"  VPINN Baseline 使用: {N_vpinn_base} 点")
+        print(f"  X-RAS 使用: {N_xras_base} 基础点 + {N_add} RAS点")
+
+        # 更新配置中的点数，用于采样函数
+        config_vpinn["n_domain"] = N_vpinn_base
+        config_xras["n_domain"] = N_xras_base
+
+        # ⚠️ 注意：config_vpinn 和 config_xras 仅在 budget_mode 下 n_domain 可能不同
+        # 在 standard_mode 下，它们都使用 config["n_domain"]
+
+    else:
+        print(f"  ✓ 标准模式: 基础点数 = {config['n_domain']}, RAS增加 = {config['N_add_ras']}")
+        config_vpinn = config
+        config_xras = config
+
+    # --- 生成采样点 (使用 VPINN 的 n_domain 设定) ---
+    # 我们先生成 VPINN 所需的 N_vpinn_base 点集，X-RAS 将在其上进行划分和 RAS
+    x_domain, x_bc = generate_sent_with_notch_points(config_vpinn)
     print(f"  域内点: {x_domain.shape[0]}, 边界点: {x_bc.shape[0]}")
 
     # 可视化初始采样
@@ -636,18 +904,97 @@ def test_sent_phase2(debug=True):
 
     # 3. 边界条件（取最大载荷）
     print("\n[3/6] 构建边界条件...")
-    max_displacement = config["max_displacement"]
+    
+    # ✅ 检查是否使用 Phase-1 结果
+    use_phase1 = config.get("use_phase1_result", False)
+    phase1_checkpoint = None
+    actual_load_value = config["max_displacement"]
+    
+    if use_phase1 and BRIDGE_AVAILABLE:
+        checkpoint_path = config.get("phase1_model_path", "outputs/phase1_checkpoint.pth")
+        
+        if os.path.exists(checkpoint_path):
+            print(f"\n  ✓ 检测到 Phase-1 检查点: {checkpoint_path}")
+            print(f"  ✓ 将从 Phase-1 加载结果作为初始状态")
+            
+            try:
+                # 加载 Phase-1 检查点
+                phase1_checkpoint = load_phase1_checkpoint(checkpoint_path, verbose=True)
+                
+                # 获取指定步的载荷
+                from phase1_phase2_bridge import get_phase1_field_at_step
+                step_index = config.get("phase1_load_step", -1)
+                step_info = get_phase1_field_at_step(phase1_checkpoint, step_index)
+                actual_load_value = step_info["load"]
+                
+                print(f"\n  使用 Phase-1 的载荷: {actual_load_value:.6f}")
+                
+            except Exception as e:
+                print(f"\n  ⚠️  加载 Phase-1 失败: {e}")
+                print(f"  将退回到标准模式（从 notch 初始化）")
+                use_phase1 = False
+                phase1_checkpoint = None
+                actual_load_value = config["max_displacement"]
+        else:
+            print(f"\n  ⚠️  Phase-1 检查点不存在: {checkpoint_path}")
+            print(f"  将退回到标准模式（从 notch 初始化）")
+            print(f"  提示: 请先运行 test_sent_fixed.py 生成 Phase-1 结果")
+            use_phase1 = False
+    elif use_phase1 and not BRIDGE_AVAILABLE:
+        print(f"\n  ⚠️  phase1_phase2_bridge.py 不可用，无法使用 Phase-1 结果")
+        print(f"  将退回到标准模式")
+        use_phase1 = False
+    
+    # 根据实际载荷生成边界条件
     get_bc = get_bc_function_sent(config)
-    u_bc = get_bc(max_displacement, x_bc)
-    print(f"  最大位移: {max_displacement}")
+    u_bc = get_bc(actual_load_value, x_bc)
+    print(f"  载荷值: {actual_load_value:.6f}")
+
+    # 提取 Phase-1 损伤场 (作为不可逆约束)
+    d_prev_field = None
+    if use_phase1 and phase1_checkpoint is not None:
+        # 重新构建一个临时网络来获取场值
+        temp_d_net = DamageNetwork()
+        temp_d_net.load_state_dict(phase1_checkpoint['d_net_state_dict'])
+        temp_d_net.eval()
+        with torch.no_grad():
+            d_prev_field = temp_d_net(x_domain).detach()  # 获取基准场
+            print(f"  [Info] 提取 Phase-1 损伤场用于约束: mean={d_prev_field.mean():.4f}")
 
     # 4. 训练VPINN baseline
     print("\n[4/6] 训练VPINN baseline...")
-    vpinn_solver, time_vpinn = run_vpinn_baseline(config, x_domain, x_bc, u_bc)
+    # VPINN 使用全量初始采样点
+    vpinn_solver, time_vpinn = run_vpinn_baseline(
+        config_vpinn, x_domain, x_bc, u_bc,
+        from_phase1=use_phase1,
+        phase1_checkpoint=phase1_checkpoint,
+        d_prev_field=d_prev_field  # ✅ 新增参数：传入历史场
+    )
 
     # 5. 训练X-RAS-PINN
     print("\n[5/6] 训练X-RAS-PINN...")
-    xras_solver, x_domain_xras, time_xras = run_xras_solver(config, x_domain, x_bc, u_bc)
+    # X-RAS 同样使用 x_domain，但在内部根据 config_xras["n_domain"] 划分/初始化
+    # 如果是非预算模式，config_xras["n_domain"] == config_vpinn["n_domain"]
+    # 如果是预算模式，config_xras["n_domain"] < config_vpinn["n_domain"]
+
+
+    # --- 为 X-RAS 提取基础点集 ---
+    if config["budget_mode"]:
+        N_xras_base = config_xras["n_domain"]  # N_xras_base < N_vpinn_base
+
+        # 随机从 x_domain 中抽取 N_xras_base 个点
+        indices = torch.randperm(x_domain.shape[0])[:N_xras_base]
+        x_domain_xras_base = x_domain[indices].clone().detach()
+        print(f"  X-RAS 初始点集从 VPINN 点集中随机抽取 {x_domain_xras_base.shape[0]} 点")
+    else:
+        x_domain_xras_base = x_domain  # 标准模式下使用全部初始点
+
+    xras_solver, x_domain_xras, time_xras = run_xras_solver(
+        config_xras, x_domain_xras_base, x_bc, u_bc,  # ✅ X-RAS 使用 config_xras 和其基础点集
+        from_phase1=use_phase1,
+        phase1_checkpoint=phase1_checkpoint,
+        d_prev_field=d_prev_field
+    )
 
     # 6. 可视化与对比
     print("\n[6/6] 生成对比可视化...")
@@ -655,11 +1002,12 @@ def test_sent_phase2(debug=True):
         config,
         vpinn_solver,
         xras_solver,
-        x_domain,
-        x_domain_xras,
+        x_domain,  # VPINN 初始采样点
+        x_domain_xras,  # X-RAS 最终采样点
         time_vpinn,
         time_xras,
-        output_dir
+        output_dir,
+        exp_name
     )
 
     # 7. 打印总结
@@ -673,41 +1021,202 @@ def test_sent_phase2(debug=True):
     print(f"  L2误差(全域): {metrics['l2_all']:.4e}")
     print(f"  L2误差(裂尖): {metrics['l2_near']:.4e}")
     print("="*70)
+
+    safe_name = exp_name.replace('-', '_').replace(' ', '')
+
+    # 8. 保存 Phase-2 原始结果（供之后离线 FE summary 使用）
+    try:
+        phase2_ckpt = {
+            "config": config,
+            "exp_name": exp_name,
+            "metrics": metrics,
+            "time_vpinn": float(time_vpinn),
+            "time_xras": float(time_xras),
+            "x_domain_vpinn": x_domain.detach().cpu().numpy(),
+            "x_domain_xras": x_domain_xras.detach().cpu().numpy(),
+            # VPINN: 单域网络
+            "vpinn_state": {
+                "u_net": vpinn_solver.u_net.state_dict(),
+                "d_net": vpinn_solver.d_net.state_dict(),
+            },
+            # X-RAS: 四个子域网络
+            "xras_state": {
+                "u_net_1": xras_solver.models.u_net_1.state_dict(),
+                "d_net_1": xras_solver.models.d_net_1.state_dict(),
+                "u_net_2": xras_solver.models.u_net_2.state_dict(),
+                "d_net_2": xras_solver.models.d_net_2.state_dict(),
+            },
+        }
+
+        ckpt_path = output_dir / f"phase2_raw_{safe_name}.pth"
+        torch.save(phase2_ckpt, ckpt_path)
+        print(f"  - Phase-2 原始 checkpoint: {ckpt_path}")
+    except Exception as e:
+        print(f"  ⚠️ 保存 Phase-2 checkpoint 失败: {e}")
+
     print(f"\n✓ 所有结果已保存到: {output_dir}")
     print("  - initial_sampling.png")
-    print("  - sent_phase2_comparison.png")
+    print(f"  - sent_phase2_comparison_{safe_name}.png")
+    print(f"  - phase2_raw_{safe_name}.pth  （供后续 FE summary 使用）")
 
     return True
+
+    # # 7+. FE 基准对比 (可选)
+    # if fe_path is not None and os.path.exists(fe_path):
+    #     print("\n[附加] FE 基准对比 (midline)...")
+    #
+    #     # 注意：component 要和 FE 载荷方向一致
+    #     # 如果 FE 是右端 x 向拉伸 → component="ux"
+    #     # 如果 FE 是上/下 y 向拉伸 → component="uy"
+    #     fe_component = "uy"  # 或 "uy"，视你的 FE 脚本而定
+    #
+    #     # VPINN vs FE
+    #     stats_v = plot_fe_vs_pinn_midline(
+    #         vpinn_solver,
+    #         fe_path=fe_path,
+    #         orientation="horizontal",  # 或 "vertical"，看你想取哪条中线
+    #         component=fe_component,
+    #         save_path=output_dir / f"fe_vs_vpinn_midline_{safe_name}.png",
+    #     )
+    #
+    #     # X-RAS vs FE
+    #     stats_x = plot_fe_vs_pinn_midline(
+    #         xras_solver,
+    #         fe_path=fe_path,
+    #         orientation="horizontal",
+    #         component=fe_component,
+    #         save_path=output_dir / f"fe_vs_xras_midline_{safe_name}.png",
+    #     )
+    #
+    #     print(f"  [FE对比] VPINN Rel L2 = {stats_v['rel_l2']:.3e}")
+    #     print(f"  [FE对比] X-RAS  Rel L2 = {stats_x['rel_l2']:.3e}")
+    #     print("  已保存: ")
+    #     print(f"   - fe_vs_vpinn_midline_{safe_name}.png")
+    #     print(f"   - fe_vs_xras_midline_{safe_name}.png")
+    # else:
+    #     print("\n[附加] 未找到 FE baseline npz，跳过 FE 对比")
+
+
+    print(f"\n✓ 所有结果已保存到: {output_dir}")
+    print("  - initial_sampling.png")
+    print(f"  - sent_phase2_comparison_{safe_name}.png")
+
+    # # 8. 可选：生成 Phase-2 vs FE 的 summary npz（便于后处理/画表）
+    # try:
+    #     # 局部导入，避免在没有 fe_baseline_utils.py 时直接崩溃
+    #     from fe_baseline_utils import (
+    #         load_fe_phasefield_npz,
+    #         compute_global_L2_for_u_and_d,
+    #         compare_damage_midline,
+    #         compare_load_reaction_curve,   # 目前没在这里用，但保留接口
+    #     )
+    # except ImportError:
+    #     print("\n[FE Summary] 找不到 fe_baseline_utils.py，跳过 FE 对比与 summary 保存。")
+    # else:
+    #     try:
+    #         # 1) 推断 FE 相场 npz 路径
+    #         #    优先使用函数参数 fe_path，如果不是 npz，则回退到默认路径
+    #         if fe_path is not None and fe_path.endswith(".npz"):
+    #             fe_npz_path = fe_path
+    #         else:
+    #             base_dir = os.path.dirname(os.path.abspath(__file__))
+    #             fe_npz_path = os.path.join(base_dir, "data", "fe_sent_phasefield.npz")
+    #
+    #         print(f"\n[FE Summary] 使用 FE 相场基准: {fe_npz_path}")
+    #
+    #         # 2) 全局 L2 误差 (u, d)：分别对 VPINN 和 X-RAS 计算
+    #         stats_v = compute_global_L2_for_u_and_d(
+    #             vpinn_solver, fe_phase_path=fe_npz_path, verbose=False
+    #         )
+    #         stats_x = compute_global_L2_for_u_and_d(
+    #             xras_solver, fe_phase_path=fe_npz_path, verbose=False
+    #         )
+    #
+    #         # 3) 水平中线 (y ≈ H/2) 的损伤误差，作为代表性局部指标
+    #         mid_v = compare_damage_midline(
+    #             vpinn_solver,
+    #             fe_phase_path=fe_npz_path,
+    #             orientation="horizontal",
+    #             verbose=False,
+    #         )
+    #         mid_x = compare_damage_midline(
+    #             xras_solver,
+    #             fe_phase_path=fe_npz_path,
+    #             orientation="horizontal",
+    #             verbose=False,
+    #         )
+    #
+    #         # 4) （占位）载荷–反力曲线误差
+    #         #    如果你后面在训练里统计了 PINN 的 reactions，可以在这里用
+    #         #    compare_load_reaction_curve(...) 得到 l2_curve_*，暂时先填 nan
+    #         l2_curve_v = float("nan")
+    #         rel_l2_curve_v = float("nan")
+    #         l2_curve_x = float("nan")
+    #         rel_l2_curve_x = float("nan")
+    #
+    #         # 5) 写入 summary npz
+    #         summary_path = output_dir / f"phase2_vs_fe_summary_{safe_name}.npz"
+    #         np.savez(
+    #             summary_path,
+    #             exp_name=exp_name,
+    #             fe_path=fe_npz_path,
+    #             # --- 全域 L2 (u, d) ---
+    #             l2_u_vpinn=stats_v["l2_u"],
+    #             rel_l2_u_vpinn=stats_v["rel_l2_u"],
+    #             l2_d_vpinn=stats_v["l2_d"],
+    #             rel_l2_d_vpinn=stats_v["rel_l2_d"],
+    #             l2_u_xras=stats_x["l2_u"],
+    #             rel_l2_u_xras=stats_x["rel_l2_u"],
+    #             l2_d_xras=stats_x["l2_d"],
+    #             rel_l2_d_xras=stats_x["rel_l2_d"],
+    #             # --- midline (horizontal) 损伤 L2 ---
+    #             l2_d_mid_vpinn=mid_v["l2"],
+    #             rel_l2_d_mid_vpinn=mid_v["rel_l2"],
+    #             l2_d_mid_xras=mid_x["l2"],
+    #             rel_l2_d_mid_xras=mid_x["rel_l2"],
+    #             # --- 载荷–反力曲线误差（占位，后面可替换为真实数值） ---
+    #             l2_curve_vpinn=l2_curve_v,
+    #             rel_l2_curve_vpinn=rel_l2_curve_v,
+    #             l2_curve_xras=l2_curve_x,
+    #             rel_l2_curve_xras=rel_l2_curve_x,
+    #         )
+    #         print(f"[FE Summary] Phase-2 vs FE summary 已保存到: {summary_path}")
+    #     except Exception as e:
+    #         print(f"[FE Summary] 生成 summary 失败: {e}")
+
+    return True
+
 
 
 # ============================================================================
 # §7 主入口
 # ============================================================================
-
-if __name__ == "__main__":
-    # 可以通过命令行参数控制模式
-    import argparse
-
-    parser = argparse.ArgumentParser(description="SENT Phase-2 对比实验")
-    parser.add_argument(
-        "--mode",
-        type=str,
-        default="debug",
-        choices=["debug", "full"],
-        help="运行模式: debug=快速测试, full=精细实验"
-    )
-
-    args = parser.parse_args()
-
-    debug_mode = (args.mode == "debug")
-
-    print(f"\n启动模式: {'DEBUG (快速测试)' if debug_mode else 'FULL (精细实验)'}")
-
-    try:
-        success = test_sent_phase2(debug=debug_mode)
-        sys.exit(0 if success else 1)
-    except Exception as e:
-        print(f"\n❌ 错误: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+#
+# if __name__ == "__main__":
+#     # 可以通过命令行参数控制模式
+#     import argparse
+#
+#     parser = argparse.ArgumentParser(description="SENT Phase-2 对比实验")
+#     parser.add_argument(
+#         "--mode",
+#         type=str,
+#         default="debug",
+#         choices=["debug", "full"],
+#         help="运行模式: debug=快速测试, full=精细实验"
+#     )
+#
+#     args = parser.parse_args()
+#
+#     debug_mode = (args.mode == "debug")
+#
+#     print(f"\n启动模式: {'DEBUG (快速测试)' if debug_mode else 'FULL (精细实验)'}")
+#
+#     try:
+#         # ✅ 调用时不再传递 config，只传递 debug 标志
+#         success = test_sent_phase2(debug=debug_mode, input_config=None)
+#         sys.exit(0 if success else 1)
+#     except Exception as e:
+#         print(f"\n❌ 错误: {e}")
+#         import traceback
+#         traceback.print_exc()
+#         sys.exit(1)

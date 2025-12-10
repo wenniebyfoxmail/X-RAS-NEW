@@ -13,11 +13,31 @@ import sys
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
+from pathlib import Path # 引入 Path 对象方便操作路径
+from fe_baseline_utils import compare_fe_pinn_midline, plot_fe_vs_pinn_midline
+
+# ===========================
+# 确保模块可导入
+# ===========================
+# 尝试将当前脚本的父目录加入路径，以导入其他模块
+sys.path.insert(0, str(Path(__file__).parent))
+# ===========================
+
+
+# 导入统一配置
+# ===========================
+try:
+    from config import create_config, print_config
+except ImportError:
+    print("错误: 找不到 config.py")
+    print("请确保 config.py 在当前目录下。")
+    sys.exit(1)
+
 
 # ===========================
 # 全局开关：调试模式
 # ===========================
-DEBUG_MODE = True   # True=快速测试；False=精细实验
+DEBUG_MODE = False   # True=快速测试；False=精细实验
 
 
 # ===========================
@@ -28,6 +48,27 @@ def get_output_dir():
     output_dir = os.path.join(os.getcwd(), "outputs")
     os.makedirs(output_dir, exist_ok=True)
     return output_dir
+
+# ===========================
+    # 导入 Phase-1 / Phase-2 桥接模块
+# ===========================
+current_dir = os.path.dirname(os.path.abspath(__file__))
+if current_dir not in sys.path:
+    sys.path.insert(0, current_dir)
+
+try:
+    import phase1_phase2_bridge
+    from phase1_phase2_bridge import save_phase1_checkpoint, load_phase1_checkpoint
+    print(f"  [Info] 成功导入桥接模块: {phase1_phase2_bridge.__file__}")
+    BRIDGE_AVAILABLE = True
+except ImportError as e:
+    print(f"  ⚠️  ImportError: {e}")
+    print(f"  ⚠️  当前 sys.path: {sys.path}")
+    print("  ⚠️  phase1_phase2_bridge.py 不存在或无法导入，无法保存/加载检查点")
+    BRIDGE_AVAILABLE = False
+except Exception as e:
+    print(f"  ⚠️  导入时发生意外错误: {e}")
+    BRIDGE_AVAILABLE = False
 
 
 # ===========================
@@ -47,99 +88,6 @@ except ImportError:
     print("错误: 找不到 phase_field_vpinn.py")
     print("请确保 phase_field_vpinn.py 在当前目录下。")
     sys.exit(1)
-
-
-# ===========================
-# 统一配置管理
-# ===========================
-def create_config(debug: bool = DEBUG_MODE):
-    """
-    统一管理所有物理 & 数值参数。
-    debug=True: 快速调参配置
-    debug=False: 论文级精细配置
-    """
-    # 几何 & 材料常数
-    L = 1.0
-    H = 1.0
-    notch_length = 0.3
-    E = 210.0
-    nu = 0.3
-    k = 1e-6
-    device = "cpu"
-    lr_u = 2e-4
-    lr_d = 2e-4
-
-    base = {
-        "L": L,
-        "H": H,
-        "notch_length": notch_length,
-        "E": E,
-        "nu": nu,
-        "k": k,
-        "device": device,
-        "lr_u": lr_u,
-        "lr_d": lr_d,
-    }
-
-    if debug:
-        print(">> Running in DEBUG_MODE (快速调参配置)")
-        base.update(
-            {
-                # 相场材料
-                "G_c": 10e-3,
-                "l": 0.003,
-                # 采样 & 载荷
-                "n_domain": 1500,
-                "n_bc": 100,
-                "max_displacement": 0.008,
-                "n_loading_steps": 8,
-                # notch 初始化
-                "notch_seed_radius": 0.02,    # 初始化种子半径（高斯核）
-                "initial_d": 0.5,             # 初始化 d 峰值
-                "notch_init_epochs": 300,     # notch 预训练 epoch
-                # 准静态训练
-                "n_epochs_initial": 700,      # 前几个 load step
-                "n_epochs_later": 350,        # 后面 load step
-                "n_epochs_switch": 3,         # n < 3 用 initial
-                "weight_irrev": 800.0,        # 不可逆约束权重
-                # notch 保持项（第1步）
-                "notch_region_radius": 0.02,
-                "notch_hold_weight": 10.0,
-                "notch_hold_target": 0.8,
-                # 远场区域半径（用于 d_far 统计）
-                "far_region_radius": 0.25,
-            }
-        )
-    else:
-        print(">> Running in FULL MODE (精细实验配置)")
-        base.update(
-            {
-                # 相场材料
-                "G_c": 6e-3,
-                "l": 0.004,
-                # 采样 & 载荷
-                "n_domain": 4000,
-                "n_bc": 200,
-                "max_displacement": 0.010,
-                "n_loading_steps": 20,
-                # notch 初始化
-                "notch_seed_radius": 0.04,
-                "initial_d": 0.65,
-                "notch_init_epochs": 1200,
-                # 准静态训练
-                "n_epochs_initial": 1200,
-                "n_epochs_later": 800,
-                "n_epochs_switch": 3,
-                "weight_irrev": 1200.0,
-                # notch 保持项
-                "notch_region_radius": 0.03,
-                "notch_hold_weight": 20.0,
-                "notch_hold_target": 0.8,
-                "far_region_radius": 0.2,
-            }
-        )
-
-    return base
 
 
 # ===========================
@@ -338,7 +286,7 @@ def get_bc_function_sent(config):
 # ===========================
 # 主测试函数
 # ===========================
-def test_sent_with_notch():
+def test_sent_with_notch(debug=False, config=None):
     """运行带 notch 的 SENT 相场测试"""
 
     output_dir = get_output_dir()
@@ -348,15 +296,24 @@ def test_sent_with_notch():
     print("  SENT Test with Notch Initialization")
     print("=" * 70)
 
+    """
+        Phase-1 主入口
+        Args:
+            debug: 是否调试模式
+            config: 可选的配置字典。如果为None，内部创建。
+        """
+
     # 1. 配置
-    print("\n[1/7] Creating configuration...")
-    config = create_config(DEBUG_MODE)
-    print(f"  Gc = {config['G_c']:.2e}")
-    print(f"  l  = {config['l']}")
-    print(f"  Gc/l = {config['G_c'] / config['l']:.2f}")
-    print(f"  n_domain = {config['n_domain']}, n_bc = {config['n_bc']}")
-    print(f"  max_displacement = {config['max_displacement']}, "
-          f"n_loading_steps = {config['n_loading_steps']}")
+    print("\n[1/7] Loading configuration...")
+    if config is None:
+        from config import create_config
+        config = create_config(debug=debug)
+
+    print_config(config)
+
+    # 设置随机种子
+    torch.manual_seed(config["seed"])
+    np.random.seed(config["seed"])
 
     # 2. 采样点
     print("\n[2/7] Generating sampling points (concentrated near notch)...")
@@ -408,6 +365,46 @@ def test_sent_with_notch():
     print("\nInitializing fields...")
     solver.initialize_fields(x_domain)
 
+    # ================================================================
+    # 【关键修复】Zero-load relaxation (预热位移场)
+    # ================================================================
+    print("\n[关键修复] Zero-load relaxation (预热位移场)...")
+
+    # 1) 构造零载荷边界条件（上下边界全部为零位移）
+    get_bc_zero = get_bc_function_sent(config)
+    u_bc_zero = get_bc_zero(0.0, x_bc)
+
+    # 2) 冻结 d_net —— 保护 notch 初始化
+    for p in solver.d_net.parameters():
+        p.requires_grad = False
+
+    # 3) 预热训练：只训练 u_net，让其趋近于零位移场
+    n_relax = 400   # 300~600 都可以
+    for epoch in range(n_relax):
+        solver.optimizer_u.zero_grad()
+
+        L_energy = solver.drm_loss.compute_energy_loss(
+            x_domain, solver.u_net, solver.d_net
+        )
+        L_bc = solver.drm_loss.compute_bc_loss(
+            x_bc, u_bc_zero, solver.u_net, weight=200.0
+        )
+        loss = L_energy + L_bc
+        loss.backward()
+        solver.optimizer_u.step()
+
+        if epoch % 100 == 0 or epoch == n_relax - 1:
+            print(f"  [Relax] Epoch {epoch:4d} | Loss={loss.item():.3e}, "
+                  f"E={L_energy.item():.2e}, BC={L_bc.item():.2e}")
+
+    # 4) 解冻 d_net
+    for p in solver.d_net.parameters():
+        p.requires_grad = True
+
+    print("  ✓ 预热完成：u_net 已接近物理零载荷平衡态\n")
+    # ================================================================
+
+
     # notch 区域掩码（用于统计 & notch 保持损失）
     notch_tip = torch.tensor([config["notch_length"], config["H"] / 2])
     distances_to_tip = torch.norm(x_domain - notch_tip, dim=1)
@@ -444,7 +441,7 @@ def test_sent_with_notch():
                 x_bc, u_bc, solver.u_net, 200.0
             )
             L_irrev = solver.drm_loss.compute_irreversibility_loss(
-                x_domain, solver.d_net, d_prev, config["weight_irrev"]
+                x_domain, solver.d_net, d_prev, config["weight_irrev_phase1"]
             )
 
             # notch 区域保持高损伤（主要在第1步）
@@ -545,7 +542,13 @@ def test_sent_with_notch():
     )
 
     result_path = os.path.join(output_dir, "sent_with_notch.png")
-    visualize_solution(solver, x_grid, nx, ny, save_path=result_path)
+
+    try:
+        visualize_solution(solver, x_grid, nx, ny, save_path=result_path)
+        plt.close('all')  # ✅ 强制关闭所有图窗，防止阻塞
+    except Exception as e:
+        print(f"  Visualization warning: {e}")
+
     print(f"  Damage field saved to: {result_path}")
 
     # 统计图
@@ -643,10 +646,21 @@ def test_sent_with_notch():
         if not criterion_3:
             print("     → d_std 偏低: 裂纹过于弥散，尝试减小 l 或调整 notch 初始化")
 
+
     print("\n生成的文件:")
     print(f"  - {sampling_path}")
     print(f"  - {result_path}")
     print(f"  - {stats_path}")
+
+    # ✅ 保存 Phase-1 检查点（供 Phase-2 使用）
+    if BRIDGE_AVAILABLE:  # ✅ 使用全局标志控制是否执行
+        try:
+            checkpoint_path = save_phase1_checkpoint(solver, history, config)
+            print(f"  - {checkpoint_path}")
+        except Exception as e:
+            print(f"  ⚠️  保存检查点失败: {e}")
+    else:
+        print("  ⚠️  phase1_phase2_bridge.py 不存在，跳过检查点保存")
 
     return solver, history
 
