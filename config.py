@@ -160,17 +160,16 @@ def create_config(debug=True):
             # ================================================================
             # 采样 & 载荷 (Phase-1) - 更密集
             # ================================================================
-            "n_domain": 40000,          # 域内采样点数
-            "n_bc": 400,               # 边界采样点数
-            "max_displacement": 0.003, # 最大位移载荷
-            "n_loading_steps": 10,     # 载荷步数
+            "max_displacement": 0.003,  # 最大位移载荷
+            "n_loading_steps": 10,  # 载荷步数
 
-            # ================================================================
-            # notch 初始化 (Phase-1)
-            # ================================================================
-            "notch_seed_radius": 0.002, # 高斯核半径, 0.5 * 特征长度l 到 1 * l
-            "initial_d": 0.8,         # 初始损伤峰值
-            "notch_init_epochs": 5000, # notch 预训练 epoch
+            "initial_d": 0.35,  # 初始损伤峰值
+            "n_domain": 6000,          # 域内采样点数
+            "n_notch": 800,
+            "n_tip": 800,
+            "n_bc": 400,               # 边界采样点数
+            "tip_radius": 0.01, # 高斯核半径, 0.5 * 特征长度l 到 1 * l
+            "notch_seed_radius" : 0.002,
 
             # Patch B
             "enable_nucleation_threshold": True,
@@ -181,24 +180,25 @@ def create_config(debug=True):
             "k": 1e-5,
 
             # Patch D
-            "stagger_u_steps": 10,
-            "stagger_d_steps": 3,
+            "stagger_u_steps": 200,
+            "stagger_d_steps": 100,
 
             # ================================================================
             # 准静态训练 (Phase-1) - 更多 epoch
             # ================================================================
-            "n_epochs_initial": 1200,  # 前几个 load step
+            "notch_init_epochs" : 1000,
+            "n_epochs_initial": 300,  # 前几个 load step
             "n_epochs_later": 800,     # 后面 load step
             "n_epochs_switch": 0,      # 切换步数
             "weight_irrev_phase1": 1200.0,
 
             # notch 保持项
             "notch_region_radius": 0.03, # l的5-10倍
-            "notch_hold_weight": 20.0,
+            "notch_hold_weight": 5000.0,
             "notch_hold_target": 1.0,
 
             # 远场区域
-            "far_region_radius": 0.2,
+            "far_region_radius": 0.1,
 
             # ================================================================
             # Phase-2: VPINN baseline

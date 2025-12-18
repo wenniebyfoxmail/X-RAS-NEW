@@ -44,7 +44,7 @@ def run_phase1(mode="full"):
 
     debug = (mode == "debug")
 
-    my_config = create_config()
+    my_config = create_config(debug=False)
 
     try:
         # 动态导入避免全局依赖

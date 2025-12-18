@@ -123,227 +123,279 @@ except ImportError:
     sys.exit(1)
 
 
-# ===========================
-# 采样点生成（SENT + notch 加密）
-# ===========================
-
-def generate_notch_line_points(config, n_notch: int = 300):
+def get_notch_band_mask(xy: torch.Tensor, config: dict) -> torch.Tensor:
     """
-    生成 notch line/band 上的点（带宽 notch_seed_radius），用于 d=1 约束损失。
-    注意：x_domain 会避开 notch band，所以必须单独生成 x_notch。
-    """
+    统一的 notch band 掩码
 
+    定义：x <= notch_length AND |y - H/2| <= notch_seed_radius
+
+    这与 FE 中的定义完全一致，所有地方必须使用同一定义！
+    """
+    x = xy[:, 0]
+    y = xy[:, 1]
+
+    notch_length = float(config["notch_length"])
+    H = float(config["H"])
+    rho = float(config.get("notch_seed_radius", 0.025))
+    y_center = H / 2.0
+
+    mask = (x <= notch_length) & (torch.abs(y - y_center) <= rho)
+    return mask
+
+
+def get_far_region_mask(xy: torch.Tensor, config: dict) -> torch.Tensor:
+    """
+    远场区域掩码（正确版本）
+
+    条件：
+    1. 距离裂尖 > far_region_radius
+    2. 且不在 notch band 内（关键修复！）
+    """
+    notch_length = float(config["notch_length"])
+    H = float(config["H"])
+    far_radius = float(config.get("far_region_radius", 0.25))
+
+    tip = torch.tensor([notch_length, H / 2.0])
+    distances = torch.norm(xy - tip, dim=1)
+
+    far_by_distance = distances > far_radius
+    notch_band = get_notch_band_mask(xy, config)
+
+    # 关键：两个条件都满足才算远场
+    far_region = far_by_distance & (~notch_band)
+
+    return far_region
+
+
+# ============================================================================
+# [修复] 三类点集生成（清晰分离）
+# ============================================================================
+
+def generate_all_points(config):
+    """
+    统一生成所有点集（清晰分离版）
+
+    返回三类互不重叠的点集：
+    1. x_notch_line: 覆盖整条 notch band，用于 loss_line (d→1)
+    2. x_tip: 裂尖小圆区域，用于 loss_tip (d→0.85，可选)
+    3. x_domain: 实体域（避开 notch band），用于 loss_energy + loss_far
+    4. x_bc: 边界点
+    """
     L = float(config["L"])
     H = float(config["H"])
     a = float(config["notch_length"])
     rho = float(config["notch_seed_radius"])
+    n_domain = int(config["n_domain"])
+    n_bc = int(config["n_bc"])
+
     y0 = H / 2.0
 
-    xs = np.random.uniform(0.0, a, size=n_notch)
-    ys = y0 + np.random.uniform(-rho, rho, size=n_notch)
-    pts = np.stack([xs, ys], axis=1)
- 
-    return torch.tensor(pts, dtype=torch.float32, requires_grad=True)
+    # ================================================================
+    # 1. x_notch_line: 覆盖整条 notch band
+    # ================================================================
+    # 关键：必须足够密！沿 x 均匀 + y 在 baçnd 内抖动
+    n_notch = max(400, int(a / rho * 10 ))
 
+    # 网格化
+    n_x = int(np.sqrt(n_notch) * 2)
+    n_y = max(5, int(np.sqrt(n_notch) / 2))
 
-def generate_sent_with_notch_points(config):
-    """
-    生成 SENT 采样点，在 notch 尖端附近加密。
-    """
-    L = config["L"]
-    H = config["H"]
-    notch_length = config["notch_length"]
-    n_domain = config["n_domain"]
-    n_bc = config["n_bc"]
+    xs_grid = np.linspace(0, a, n_x)
+    ys_grid = np.linspace(y0 - rho, y0 + rho, n_y)
+    XX, YY = np.meshgrid(xs_grid, ys_grid)
+    x_notch_grid = np.stack([XX.flatten(), YY.flatten()], axis=1)
 
-    notch_tip = np.array([notch_length, H / 2])
+    # 加一些随机点
+    n_rand = n_notch - len(x_notch_grid)
+    if n_rand > 0:
+        xs_rand = np.random.uniform(0, a, n_rand)
+        ys_rand = y0 + np.random.uniform(-rho, rho, n_rand)
+        x_notch_rand = np.stack([xs_rand, ys_rand], axis=1)
+        x_notch_line = np.vstack([x_notch_grid, x_notch_rand])
+    else:
+        x_notch_line = x_notch_grid
 
-    # ------------------------------------------------
-    # 1. 局部加密：只针对初始裂尖 (Local Refinement at Tip)
-    # ------------------------------------------------
-    # 即使不知道裂纹去哪，我们肯定知道它从尖端开始。
-    # 这里分配 10% ~ 20% 的点用于捕捉起裂瞬间。
-    n_tip = int(n_domain * 0.15)
-    radius_tip = 0.05  # 局部加密半径 (只覆盖尖端周围一小圈)
+    print(f"  [Points] x_notch_line: {len(x_notch_line)} points (notch band)")
 
-    x_tip_list = []
-    for _ in range(n_tip):
-        # 在圆内随机撒点
-        r = np.random.uniform(0, radius_tip)
-        theta = np.random.uniform(0, 2 * np.pi)
-        x = notch_tip[0] + r * np.cos(theta)
-        y = notch_tip[1] + r * np.sin(theta)
+    # ================================================================
+    # 2. x_tip: 裂尖小圆区域（独立于 x_domain）
+    # ================================================================
+    r_tip = 2.5 * rho
+    n_tip = 800
 
-        # 边界检查
-        if 0 <= x <= L and 0 <= y <= H:
-            # 还要避开 Notch 内部空洞
-            if not (x <= notch_length and abs(y - H / 2) <= config["notch_seed_radius"]):
-                x_tip_list.append([x, y])
+    tip_center = np.array([a, y0])
 
-    # ------------------------------------------------
-    # 2. 全场均匀采样：背景 (Global Uniform)
-    # ------------------------------------------------
-    # 剩下的点全部均匀撒在整个矩形里。
-    # 这是最“诚实”的做法，不假设任何路径。
-    n_uniform = n_domain - len(x_tip_list)
+    r_samples = np.sqrt(np.random.uniform(0, 1, n_tip * 2)) * r_tip
+    theta_samples = np.random.uniform(0, 2 * np.pi, n_tip * 2)
 
-    x_uniform_list = []
-    while len(x_uniform_list) < n_uniform:
+    xs_tip = tip_center[0] + r_samples * np.cos(theta_samples)
+    ys_tip = tip_center[1] + r_samples * np.sin(theta_samples)
+
+    # 过滤：在域内，且不在 notch band 内
+    valid = (xs_tip >= 0) & (xs_tip <= L) & (ys_tip >= 0) & (ys_tip <= H)
+    in_notch = (xs_tip <= a) & (np.abs(ys_tip - y0) <= rho)
+    valid = valid & (~in_notch)
+
+    x_tip = np.stack([xs_tip[valid][:n_tip], ys_tip[valid][:n_tip]], axis=1)
+
+    print(f"  [Points] x_tip: {len(x_tip)} points (tip region, r < {r_tip:.4f})")
+
+    # ================================================================
+    # 3. x_domain: 实体域（避开 notch band）
+    # ================================================================
+    n_uniform = int(n_domain * 0.85)
+    n_near_tip = n_domain - n_uniform
+
+    # 3.1 全局均匀
+    x_uniform = []
+    while len(x_uniform) < n_uniform:
         x = np.random.uniform(0, L)
         y = np.random.uniform(0, H)
-
-        # 避开 Notch 内部空洞
-        if x <= notch_length and abs(y - H / 2) <= config.get("notch_seed_radius", 0.01):
+        if x <= a and abs(y - y0) <= rho:
             continue
+        x_uniform.append([x, y])
+    x_uniform = np.array(x_uniform)
 
-        x_uniform_list.append([x, y])
+    # 3.2 裂尖外围（r_tip < r < 2*r_tip 的环形区域）
+    r_outer = 2 * r_tip
+    x_near_tip = []
+    attempts = 0
+    while len(x_near_tip) < n_near_tip and attempts < n_near_tip * 10:
+        r = np.random.uniform(r_tip, r_outer)
+        theta = np.random.uniform(0, 2 * np.pi)
+        x = tip_center[0] + r * np.cos(theta)
+        y = tip_center[1] + r * np.sin(theta)
+        attempts += 1
 
-    # 合并
-    x_domain = np.vstack((x_tip_list, x_uniform_list))
+        if not (0 <= x <= L and 0 <= y <= H):
+            continue
+        if x <= a and abs(y - y0) <= rho:
+            continue
+        x_near_tip.append([x, y])
 
-    # # 70% 均匀 + 30% notch 附近
-    # n_uniform = int(n_domain * 0.7)
-    # n_concentrated = n_domain - n_uniform
-    #
-    # x_domain_list = []
-    #
-    # # 1) 均匀采样（略避开 notch 凹槽）
-    # while len(x_domain_list) < n_uniform:
-    #     x = np.random.uniform(0, L)
-    #     y = np.random.uniform(0, H)
-    #
-    #     notch_band = float(config.get("notch_seed_radius", 0.01))
-    #     if x <= notch_length and abs(y - H / 2) <= notch_band:
-    #         continue
-    #
-    #     x_domain_list.append([x, y])
-    #
-    # # 2) notch 尖端附近加密
-    # radius_local = 0.02
-    # for _ in range(n_concentrated):
-    #     angle = np.random.uniform(0, 2 * np.pi)
-    #     r = np.random.uniform(0, radius_local)
-    #
-    #     x = notch_tip[0] + r * np.cos(angle)
-    #     y = notch_tip[1] + r * np.sin(angle)
-    #
-    #     if 0 <= x <= L and 0 <= y <= H:
-    #         notch_band = float(config.get("notch_seed_radius", 0.01))
-    #         if not (x <= notch_length and abs(y - H / 2) <= notch_band):
-    #             x_domain_list.append([x, y])
-    #
-    # x_domain = torch.tensor(x_domain_list, dtype=torch.float32)
-    #
-    # 边界点：下边固定，上边施加位移
+    x_near_tip = np.array(x_near_tip) if x_near_tip else np.empty((0, 2))
+    x_domain = np.vstack([x_uniform, x_near_tip]) if len(x_near_tip) > 0 else x_uniform
+
+    print(f"  [Points] x_domain: {len(x_domain)} points (uniform: {len(x_uniform)}, near_tip: {len(x_near_tip)})")
+
+    # ================================================================
+    # 4. x_bc: 边界点
+    # ================================================================
     n_bc_half = n_bc // 2
+
     x_bottom = np.linspace(0, L, n_bc_half)
-    y_bottom = np.zeros_like(x_bottom)
-    bc_bottom = np.stack([x_bottom, y_bottom], axis=1)
+    bc_bottom = np.stack([x_bottom, np.zeros_like(x_bottom)], axis=1)
 
     x_top = np.linspace(0, L, n_bc_half)
-    y_top = np.ones_like(x_top) * H
-    bc_top = np.stack([x_top, y_top], axis=1)
+    bc_top = np.stack([x_top, np.full_like(x_top, H)], axis=1)
 
-    x_bc = torch.tensor(np.vstack([bc_bottom, bc_top]), dtype=torch.float32)
+    x_bc = np.vstack([bc_bottom, bc_top])
 
-    return torch.tensor(x_domain, dtype=torch.float32, requires_grad=True), x_bc, x_notch
+    # 转为 tensor
+    x_domain = torch.tensor(x_domain, dtype=torch.float32, requires_grad=True)
+    x_notch_line = torch.tensor(x_notch_line, dtype=torch.float32, requires_grad=True)
+    x_tip = torch.tensor(x_tip, dtype=torch.float32, requires_grad=True)
+    x_bc = torch.tensor(x_bc, dtype=torch.float32)
+
+    return x_domain, x_notch_line, x_tip, x_bc
 
 
-# ===========================
-# notch 初始损伤种子
-# ===========================
-def initialize_notch_damage(d_net, x_domain, config):
+# ============================================================================
+# [修复] Notch 初始化（使用 x_notch_line）
+# ============================================================================
+
+def initialize_notch_damage(d_net, x_domain, x_notch_line, x_tip, config):
     """
-        规范 notch 初始化（与 FE 一致）：
-        1) 线裂纹带：x<=a 且 |y-H/2|<=rho 处 d_target=1
-        2) 裂尖平滑：在 tip 周围叠加 gaussian（可选）
-        3) 远场压制：对非 line 区域在 r>cut_radius 时强制 0
-    """
+    修复版 notch 初始化
 
+    核心改动：
+    - loss_line 在 x_notch_line 上计算，目标 d=1
+    - loss_tip 在 x_tip 上计算，目标 d=0.85（不是 1！）
+    - loss_far 在 x_domain 远场计算，目标 d=0
+    - 三个损失互不干扰
+    """
     notch_length = config["notch_length"]
     H = config["H"]
     initial_d = config["initial_d"]
-    seed_radius = config["notch_seed_radius"]
+    rho = config["notch_seed_radius"]
     n_epochs = config["notch_init_epochs"]
 
-    notch_tip = torch.tensor([notch_length, H / 2.0])
-    x = x_domain[:, 0]
-    y = x_domain[:, 1]
-    y0 = H / 2.0
+    tip_pos = torch.tensor([notch_length, H / 2.0])
 
-    # (1) line notch band
-    line_mask = (x <= notch_length) & (torch.abs(y - y0) <= seed_radius)
+    # ========================================
+    # 构建目标场
+    # ========================================
 
-    # (2) tip gaussian smoothing
-    distances = torch.norm(x_domain - notch_tip, dim=1)
-    d_gauss = initial_d * torch.exp(-(distances / seed_radius) ** 2)
-    d_target = d_gauss.unsqueeze(1).clamp(0.0, 1.0)
-    d_target[line_mask] = 1.0
-    d_target = d_target.detach()
+    # 1) x_notch_line 目标：全部为 1.0
+    d_target_notch = torch.ones((x_notch_line.shape[0], 1), dtype=torch.float32)
 
-    # (3) far clamp ONLY outside the line region
-    cut_radius = 1.5 * seed_radius
-    far_mask = (distances > cut_radius) & (~line_mask)
-    d_target[far_mask] = 0.0
+    # 2) x_tip 目标：0.85（平滑过渡，不要设 1！）
+    d_target_tip = torch.full((x_tip.shape[0], 1), 0.85, dtype=torch.float32)
 
-    # (4) very close points near tip can be strengthened (optional)
-    very_close = distances < (0.5 * seed_radius)
-    d_target[very_close] = 0.98
+    # 3) x_domain 目标：tip 附近高斯衰减，远场为 0
+    distances_domain = torch.norm(x_domain - tip_pos, dim=1)
+    d_target_domain = initial_d * torch.exp(-(distances_domain / rho) ** 2)
+    d_target_domain = d_target_domain.unsqueeze(1).clamp(0.0, 1.0)
 
-    print("\n  初始化 notch 损伤种子:")
-    print(f"    尖端位置: ({notch_length:.2f}, {H/2:.2f})")
-    print(f"    高斯半径: {seed_radius:.3f}")
-    print(f"    初始峰值: {initial_d:.2f}")
-    print(f"    受影响点数(d>0.1): {(d_target > 0.1).sum().item()}")
-    print(f"    极近点数(d>0.9):   {(d_target > 0.9).sum().item()}")
+    # 远场强制为 0
+    cut_radius = 2.5 * rho
+    far_domain = distances_domain > cut_radius
+    d_target_domain[far_domain] = 0.0
+
+    d_target_notch = d_target_notch.detach()
+    d_target_tip = d_target_tip.detach()
+    d_target_domain = d_target_domain.detach()
+
+    print("\n  初始化 notch 损伤种子 (修复版):")
+    print(f"    x_notch_line: {x_notch_line.shape[0]} points, target=1.0")
+    print(f"    x_tip:        {x_tip.shape[0]} points, target=0.85")
+    print(f"    x_domain:     {x_domain.shape[0]} points, gaussian decay")
+    print(f"    tip 位置: ({notch_length:.2f}, {H / 2:.2f})")
 
     optimizer = torch.optim.Adam(d_net.parameters(), lr=5e-4)
 
     best_loss = float("inf")
     patience = 0
 
-    print(f"    训练 d_net 拟合 d_target（{n_epochs} epochs）...")
+    print(f"    训练 d_net 拟合目标（{n_epochs} epochs）...")
 
-    # 同步更新
     for epoch in range(n_epochs):
         optimizer.zero_grad()
-        d_pred = d_net(x_domain)
 
-        loss_mse = torch.mean((d_pred - d_target) ** 2)
+        # 预测
+        d_pred_notch = d_net(x_notch_line)
+        d_pred_tip = d_net(x_tip)
+        d_pred_domain = d_net(x_domain)
 
-        tip_points = distances < seed_radius
-        if tip_points.sum() > 0:
-            loss_tip = torch.mean((d_pred[tip_points] - 0.95) ** 2)
+        # 损失1: x_notch_line 上必须 = 1（最重要！）
+        loss_line = 5.0 * torch.mean((d_pred_notch - d_target_notch) ** 2)
+
+        # 损失2: x_tip 上 = 0.85（平滑过渡）
+        loss_tip = 1.0 * torch.mean((d_pred_tip - d_target_tip) ** 2)
+
+        # 损失3: x_domain MSE
+        loss_domain = torch.mean((d_pred_domain - d_target_domain) ** 2)
+
+        # 损失4: 远场抑制（必须排除 notch band，但 x_domain 已避开）
+        if far_domain.sum() > 0:
+            loss_far = 2.0 * torch.mean(d_pred_domain[far_domain] ** 2)
         else:
-            loss_tip = 0.0
+            loss_far = torch.tensor(0.0)
 
-        # line enforcement: keep d≈1 on the pre-crack band
-        if line_mask.sum() > 0:
-            loss_line = torch.mean((d_pred[line_mask] - 1.0) ** 2)
-        else:
-            loss_line = 0.0
+        loss = loss_line + loss_tip + loss_domain + loss_far
 
-        # IMPORTANT: far penalty must exclude the notch band, otherwise it will fight loss_line
-        far_points = (distances > cut_radius) & (~line_mask)
-        if far_points.sum() > 0:
-            loss_far = torch.mean(d_pred[far_points] ** 2)
-        else:
-            loss_far = 0.0
-
-        loss = loss_mse + 2.0 * loss_line + 1.0 * loss_tip + 2.0 * loss_far
-
-        # loss = loss_mse + 2.0 * loss_tip
         loss.backward()
         optimizer.step()
 
         if epoch % 200 == 0 or epoch == n_epochs - 1:
             with torch.no_grad():
-                d_max_now = d_pred.max().item()
-                d_mean_now = d_pred.mean().item()
-            print(
-                f"      Epoch {epoch:4d}: loss={loss.item():.6e} | "
-                f"d_max={d_max_now:.3f}, d_mean={d_mean_now:.3f}"
-            )
+                d_max = d_pred_domain.max().item()
+                d_mean = d_pred_domain.mean().item()
+                d_notch_mean = d_pred_notch.mean().item()
+                d_tip_mean = d_pred_tip.mean().item()
+            print(f"      Epoch {epoch:4d}: loss={loss.item():.4e} | "
+                  f"notch={d_notch_mean:.3f}, tip={d_tip_mean:.3f}, "
+                  f"d_max={d_max:.3f}, d_mean={d_mean:.3f}")
 
         if loss.item() < best_loss:
             best_loss = loss.item()
@@ -355,23 +407,58 @@ def initialize_notch_damage(d_net, x_domain, config):
                 break
 
     with torch.no_grad():
-        d_final = d_net(x_domain)
-        d_max = d_final.max().item()
-        d_mean = d_final.mean().item()
-        d_std = d_final.std().item()
-        d_at_tip = (
-            d_final[distances < seed_radius].mean().item()
-            if (distances < seed_radius).sum() > 0
-            else 0.0
-        )
+        d_final_notch = d_net(x_notch_line)
+        d_final_domain = d_net(x_domain)
 
     print("\n    ✓ 初始化完成:")
-    print(f"      d_max:    {d_max:.3f}")
-    print(f"      d_mean:   {d_mean:.3f}")
-    print(f"      d_std:    {d_std:.3f}")
-    print(f"      d_at_tip: {d_at_tip:.3f}")
+    print(f"      notch_line mean: {d_final_notch.mean().item():.3f} (target=1.0)")
+    print(f"      domain d_max:    {d_final_domain.max().item():.3f}")
+    print(f"      domain d_mean:   {d_final_domain.mean().item():.3f}")
 
     return d_net
+
+
+# ============================================================================
+# [修复] 损失计算器
+# ============================================================================
+
+class NotchLossComputer:
+    """
+    清晰的 notch 相关损失计算器
+
+    - loss_line: 在 x_notch_line 上，d → 1
+    - loss_tip: 在 x_tip 上，d → 0.85（可选）
+    - loss_far: 在 x_domain 远场，d → 0
+    """
+
+    def __init__(self, config):
+        self.config = config
+        self.notch_length = float(config["notch_length"])
+        self.H = float(config["H"])
+        self.rho = float(config.get("notch_seed_radius", 0.025))
+        self.far_radius = float(config.get("far_region_radius", 0.25))
+
+    def compute_loss_line(self, d_net, x_notch_line, weight=500.0):
+        """Notch 带约束：d → 1"""
+        d_pred = d_net(x_notch_line)
+        return weight * torch.mean((d_pred - 1.0) ** 2)
+
+    def compute_loss_tip(self, d_net, x_tip, weight=50.0, target=0.85):
+        """裂尖平滑：d → 0.85（可选）"""
+        if x_tip is None or len(x_tip) == 0:
+            return torch.tensor(0.0)
+        d_pred = d_net(x_tip)
+        return weight * torch.mean((d_pred - target) ** 2)
+
+    def compute_loss_far(self, d_net, x_domain, weight=100.0):
+        """远场抑制：d → 0（正确排除 notch band）"""
+        far_region = get_far_region_mask(x_domain, self.config)
+
+        if far_region.sum() == 0:
+            return torch.tensor(0.0)
+
+        d_far = d_net(x_domain[far_region])
+        return weight * torch.mean(d_far ** 2)
 
 
 # ===========================
@@ -379,27 +466,84 @@ def initialize_notch_damage(d_net, x_domain, config):
 # ===========================
 def get_bc_function_sent(config):
     """拉伸：下边固定，上边 y 向位移 = load_value"""
-
     H = config["H"]
 
     def get_bc(load_value, x_bc):
         n_bc = x_bc.shape[0]
         u_bc = torch.zeros(n_bc, 2)
-        # 下边：全零
         u_bc[: n_bc // 2, :] = 0.0
-        # 上边：x 方向 0, y 方向 = load_value
-        u_bc[n_bc // 2 :, 0] = 0.0
-        u_bc[n_bc // 2 :, 1] = load_value
+        u_bc[n_bc // 2:, 0] = 0.0
+        u_bc[n_bc // 2:, 1] = load_value
         return u_bc
 
     return get_bc
 
+# ===========================
+# 可视化点集（调试用）
+# ===========================
+def visualize_point_sets(x_domain, x_notch_line, x_tip, config, save_path):
+    """可视化三类点集"""
+    fig, ax = plt.subplots(figsize=(12, 10))
+
+    ax.scatter(x_domain[:, 0].detach().numpy(),
+               x_domain[:, 1].detach().numpy(),
+               c='blue', s=1, alpha=0.3, label=f'x_domain ({len(x_domain)})')
+
+    ax.scatter(x_notch_line[:, 0].detach().numpy(),
+               x_notch_line[:, 1].detach().numpy(),
+               c='red', s=8, alpha=0.8, label=f'x_notch_line ({len(x_notch_line)})')
+
+    if len(x_tip) > 0:
+        ax.scatter(x_tip[:, 0].detach().numpy(),
+                   x_tip[:, 1].detach().numpy(),
+                   c='green', s=10, alpha=0.8, label=f'x_tip ({len(x_tip)})')
+
+    a = config["notch_length"]
+    H = config["H"]
+    rho = config.get("notch_seed_radius", 0.025)
+
+    ax.plot([0, a, a, 0, 0],
+            [H / 2 - rho, H / 2 - rho, H / 2 + rho, H / 2 + rho, H / 2 - rho],
+            'k--', linewidth=2, label='Notch band')
+    ax.plot(a, H / 2, 'k*', markersize=20, label='Crack tip')
+
+    r_far = config.get("far_region_radius", 0.25)
+    theta = np.linspace(0, 2 * np.pi, 100)
+    ax.plot(a + r_far * np.cos(theta), H / 2 + r_far * np.sin(theta),
+            'orange', linestyle='--', linewidth=1, label=f'Far boundary (r={r_far})')
+
+    ax.set_xlim(-0.05, config["L"] + 0.05)
+    ax.set_ylim(-0.05, config["H"] + 0.05)
+    ax.set_aspect('equal')
+    ax.legend(loc='upper right')
+    ax.set_title('Point Sets: x_domain (blue), x_notch_line (red), x_tip (green)')
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150)
+    plt.close()
+    print(f"  [Viz] Point sets saved to: {save_path}")
 
 # ===========================
 # 主测试函数
 # ===========================
 def test_sent_with_notch(debug=False, config = None):
-    """运行带 notch 的 SENT 相场测试"""
+
+    """
+        Phase-1 主入口
+        Args:
+            debug: 是否调试模式
+            config: 可选的配置字典。如果为None，内部创建。
+        """
+
+
+    # 1. 配置
+    print("\n[1/7] Loading configuration...")
+    if config is None:
+        from config import create_config
+        config = create_config(debug= False)
+
+    print_config(config)
 
     current_time = datetime.datetime.now()
     timestamp_str = current_time.strftime("%Y%m%d_%H%M%S")
@@ -411,6 +555,7 @@ def test_sent_with_notch(debug=False, config = None):
 
     os.makedirs(output_dir, exist_ok=True)
     print(f"🚀 本次实验输出目录: {output_dir}")
+
     # 将时间戳存入 config，方便后续调用
     config["timestamp"] = readable_time
     config["run_id"] = timestamp_str
@@ -418,58 +563,44 @@ def test_sent_with_notch(debug=False, config = None):
     save_experiment_log(output_dir, config)
 
     print(f"输出目录: {output_dir}")
-
     print("=" * 70)
     print("  SENT Test with Notch Initialization")
     print("=" * 70)
-
-    """
-        Phase-1 主入口
-        Args:
-            debug: 是否调试模式
-            config: 可选的配置字典。如果为None，内部创建。
-        """
-
-    # 1. 配置
-    print("\n[1/7] Loading configuration...")
-    if config is None:
-        from config import create_config
-        config = create_config(debug=debug)
-
-    print_config(config)
 
     # 设置随机种子
     torch.manual_seed(config["seed"])
     np.random.seed(config["seed"])
 
-    # 2. 采样点
+    # 2. 采样点(三类点集)
     print("\n[2/7] Generating sampling points (concentrated near notch)...")
-    x_domain, x_bc = generate_sent_with_notch_points(config)
+    x_domain, x_notch_line, x_tip, x_bc = generate_all_points(config)
 
-    print(f"  Domain points: {x_domain.shape[0]}")
+    print(f"  Total points:")
+    print(f"    x_domain:     {x_domain.shape[0]}")
+    print(f"    x_notch_line: {x_notch_line.shape[0]}")
+    print(f"    x_tip:        {x_tip.shape[0]}")
+    print(f"    x_bc:         {x_bc.shape[0]}")
 
-    # notch band points (must exist, since x_domain avoids notch band)
-    x_notch = generate_notch_line_points(config, n_notch=int(config.get("n_notch", 400)))
+    # 保存点集可视化
+    point_sets_path = os.path.join(output_dir, "point_sets.png")
+    visualize_point_sets(x_domain, x_notch_line, x_tip, config, point_sets_path)
 
-    # 保存采样点图
-    plt.figure(figsize=(6, 4))
+    # 保存采样点图（兼容旧版）
+    plt.figure(figsize=(8, 6))
     pts = x_domain.detach().numpy()
-    plt.scatter(pts[:, 0], pts[:, 1], s=1, alpha=0.5)
-    plt.scatter(
-        config["notch_length"],
-        config["H"] / 2,
-        s=80,
-        c="red",
-        marker="*",
-        label="Notch tip",
-    )
+    plt.scatter(pts[:, 0], pts[:, 1], s=1, alpha=0.3, c='blue', label='x_domain')
+    plt.scatter(x_notch_line[:, 0].detach().numpy(), x_notch_line[:, 1].detach().numpy(),
+                s=5, alpha=0.8, c='red', label='x_notch_line')
+    plt.scatter(config["notch_length"], config["H"] / 2, s=100, c="black", marker="*", label="Tip")
     plt.xlabel("x")
     plt.ylabel("y")
     plt.title("Sampling Points Distribution")
     plt.legend()
+    plt.axis('equal')
     sampling_path = os.path.join(output_dir, "sampling_points.png")
     plt.savefig(sampling_path, dpi=150)
     plt.close()
+
     print(f"  Sampling visualization saved to: {sampling_path}")
 
     # 3. 网络
@@ -479,14 +610,15 @@ def test_sent_with_notch(debug=False, config = None):
 
     # 4. 初始化 notch 损伤
     print("\n[4/7] Initializing notch damage seed...")
-
-    # Use a seed set that actually includes the notch band
-    x_seed = torch.cat([x_domain, x_notch], dim=0)
-    d_net = initialize_notch_damage(d_net, x_seed, config)
+    d_net = initialize_notch_damage(d_net, x_domain, x_notch_line, x_tip, config)
 
     # 5. 求解器
     print("\n[5/7] Creating solver...")
     solver = PhaseFieldSolver(config, u_net, d_net)
+
+    # 创建损失计算器
+    notch_loss_computer = NotchLossComputer(config)
+
 
     # 6. 准静态加载
     print("\n[6/7] Quasi-static loading...")
@@ -501,7 +633,7 @@ def test_sent_with_notch(debug=False, config = None):
     solver.initialize_fields(x_domain)
 
     # ================================================================
-    # 【关键修复】Zero-load relaxation (预热位移场)
+    # Zero-load relaxation (预热位移场)
     # ================================================================
     print("\n[关键修复] Zero-load relaxation (预热位移场)...")
 
@@ -539,32 +671,30 @@ def test_sent_with_notch(debug=False, config = None):
     print("  ✓ 预热完成：u_net 已接近物理零载荷平衡态\n")
     # ================================================================
 
-
-    # notch 区域掩码（用于统计 & notch 保持损失）
-    notch_tip = torch.tensor([config["notch_length"], config["H"] / 2])
-    distances_to_tip = torch.norm(x_domain - notch_tip, dim=1)
-
     # 这里定义了哪里是“远场” (far_region)
-    # 凡是距离裂尖大于 0.25 (config中定义的半径) 的点，都算远场
+    # 凡是距离裂尖大于config中定义的半径的点，都算远场
 
-    far_region = distances_to_tip > config["far_region_radius"]
+    far_region = get_far_region_mask(x_domain, config)
+    print(f"  [Info] far_region: {far_region.sum().item()}/{len(far_region)} points")
 
-    # Diagnostics regions: keep your tip/far metrics if you want,
-    # but notch hold MUST be applied on x_notch (line band), not on x_domain.
-    notch_tip = torch.tensor([config["notch_length"], config["H"] / 2])
-    distances_to_tip = torch.norm(x_domain - notch_tip, dim=1)
-    far_region = distances_to_tip > config["far_region_radius"]
+    # 验证：far_region 与 notch band 无重叠
+    notch_in_domain = get_notch_band_mask(x_domain, config)
+    overlap = (far_region & notch_in_domain).sum().item()
+    print(f"  [Check] far_region ∩ notch_band = {overlap} (should be 0)")
 
-    # 确保 solver.d_prev 已经初始化 (在 initialize_fields 中已完成)
-    # 如果没有初始化，手动初始化一次
     if solver.d_prev is None:
         with torch.no_grad():
             solver.d_prev = solver.d_net(x_domain).detach().clone()
+
+    with torch.no_grad():
+        d_prev_global = solver.d_net(x_domain).detach().clone()
 
 
     with torch.no_grad():
         d_prev_global = solver.d_net(x_domain).detach().clone()
 
+
+    # 训练主循环
     for n, load_value in enumerate(loading_steps):
         print("\n" + "=" * 60)
         print(f"Step {n + 1}/{len(loading_steps)} | Load = {load_value:.6f}")
@@ -630,7 +760,7 @@ def test_sent_with_notch(debug=False, config = None):
                 solver.optimizer_u.step()
 
             loss_d = torch.tensor(0.0, device=solver.device)
-            L_irrev = torch.tensor(0.0, device=solver.device)
+            # L_irrev = torch.tensor(0.0, device=solver.device)
 
             # === Phase 2: 更新 d（冻结 u）===
             for p in solver.d_net.parameters(): p.requires_grad = True
@@ -644,34 +774,23 @@ def test_sent_with_notch(debug=False, config = None):
                     x_domain, solver.u_net, solver.d_net, d_prev=d_prev_step
                 )
 
-                # 2. 不可逆 Loss (Soft Constraint)
-                # 【报错修复点】：这里传入 solver.d_prev，而不是未定义的 d_prev
-                L_irrev = solver.drm_loss.compute_irreversibility_loss(
-                    x_domain, solver.d_net, solver.d_prev, config["weight_irrev_phase1"]
+                # 2. [修复] Notch Line Loss（使用 x_notch_line）
+                L_notch = notch_loss_computer.compute_loss_line(
+                    solver.d_net, x_notch_line,
+                    weight=float(config.get("notch_hold_weight", 500.0))
                 )
-                L_irrev = torch.tensor(0.0, device=solver.device)
 
-                # 3. Notch Loss (强力锚点)
-                # 建议把 notch_hold_weight 设大，例如 5000.0
-                d_notch_pred = solver.d_net(x_notch)
-                notch_weight = float(config.get("notch_hold_weight", 5000.0))
-                target_notch_d = float(config["notch_hold_target"])
-                L_notch = notch_weight * torch.mean((d_notch_pred - target_notch_d) ** 2)
+                ## 2. 不可逆 Loss (Soft Constraint)
+                # # 【报错修复点】：这里传入 solver.d_prev，而不是未定义的 d_prev
+                # L_irrev = solver.drm_loss.compute_irreversibility_loss(
+                #     x_domain, solver.d_net, solver.d_prev, config["weight_irrev_phase1"]
+                # )
+                # L_irrev = torch.tensor(0.0, device=solver.device)
 
-                # [新增] 远场抑制损失
-                # 逻辑：如果在 far_region 里的点 d 不为 0，就罚款
-                if far_region.sum() > 0:
-                    # 1. 选出远场的点对应的预测损伤值
-                    d_far_pred = solver.d_net(x_domain[far_region])
-
-                    # 2. 给予一个权重 (建议和 Notch Weight 同量级，例如 100.0)
-                    # 你的 config["notch_hold_weight"] 大概是 10.0~20.0，建议这里给大一点，比如 100.0
-                    w_far = 100.0
-
-                    # 3. 计算均方误差 (目标是 0)
-                    L_far = w_far * torch.mean(d_far_pred ** 2)
-                else:
-                    L_far = torch.tensor(0.0, device=solver.device)
+                # 3. [修复] Far Loss（正确排除 notch band）
+                L_far = notch_loss_computer.compute_loss_far(
+                    solver.d_net, x_domain, weight=100.0
+                )
 
                 loss_d = L_energy_d + L_notch + L_far # No more L_iir
                 loss_d.backward()
@@ -700,10 +819,10 @@ def test_sent_with_notch(debug=False, config = None):
                     # 打印 raw 和 phys 的区别，帮助 Debug
                     d_raw_max = d_curr_raw.max().item()
 
-                    d_notch_raw = solver.d_net(x_notch)
-                    # d_notch_phys = torch.max(d_notch_raw, solver.d_prev(x_notch))
-                    d_notch_raw_val = d_notch_raw.mean().item()
-                    #d_notch_phys_val = d_notch_phys.mean().item()
+                    d_tip_raw = solver.d_net(x_tip)
+                    d_line_raw = solver.d_net(x_notch_line)
+                    d_tip_raw_val = d_tip_raw.mean().item()
+                    d_line_raw_val = d_line_raw.mean().item()
 
                     # 历史场的状态
                     hist_mean = solver.d_prev.mean().item()
@@ -719,8 +838,7 @@ def test_sent_with_notch(debug=False, config = None):
                     f"Loss_u={loss_u.item():.2e}, Loss_d={loss_d.item():.2e} | "
                     f"d_phys_max={d_max:.3f} (raw={d_raw_max:.3f}), "
                     f"d_mean={d_mean:.3f}, "
-                    f"notch_raw_val={d_notch_raw_val:.3f},"
-                    f"IrrLoss={L_irrev.item():.2e}"
+                    f"line_raw_val={d_line_raw_val:.3f}, tip_raw_val={d_tip_raw_val:.3f}"
                 )
 
             # 在 test_sent_pinn.py 的训练循环中添加（每 500 epoch）
@@ -776,10 +894,11 @@ def test_sent_with_notch(debug=False, config = None):
             d_far_f = 0.0
 
         # 获取 Notch 区域均值
-        d_notch_f = solver.d_net(x_notch).mean().item()
+        d_line_f = solver.d_net(x_notch_line).mean().item()
+        d_tip_f = solver.d_net(x_tip).mean().item()
 
         # 计算 loc_index (避免除以0)
-        loc_index_f = d_notch_f / (d_far_f + 1e-6) if d_far_f > 0 else 0.0
+        loc_index_f = d_line_f / (d_far_f + 1e-6) if d_far_f > 0 else 0.0
 
         print(f"  [End of Step {n + 1}] History updated. New Max: {d_max_f:.4f}, Loc: {loc_index_f:.1f}")
 
@@ -787,10 +906,12 @@ def test_sent_with_notch(debug=False, config = None):
         history.append({
             "step": n,
             "load": load_value,
-            "d_max": d_max_f,
+            "d_max_phy": d_max_f,
             "d_mean": d_mean_f,
             "d_std": d_std_f,
-            "d_notch": d_notch_f,
+            "d_tip": d_tip_raw_val,
+            "d_line": d_line_f,
+            "d_tip": d_tip_f,
             "d_far": d_far_f,
             "loc_index": loc_index_f,
         })
