@@ -17,12 +17,14 @@ import matplotlib.pyplot as plt
 class DisplacementNetwork(nn.Module):
     """位移场网络 u_theta(x) -> (u, v)"""
     
-    def __init__(self, layers=[2, 64, 64, 64, 2]):
+    def __init__(self, layers=[2, 64, 64, 64, 2], u_scale: float = 1):
         super().__init__()
         self.layers = nn.ModuleList()
         for i in range(len(layers) - 1):
             self.layers.append(nn.Linear(layers[i], layers[i+1]))
-    
+        self.u_scale = u_scale
+
+
     def forward(self, x):
         """
         Args:
@@ -33,7 +35,7 @@ class DisplacementNetwork(nn.Module):
         for i, layer in enumerate(self.layers[:-1]):
             x = torch.tanh(layer(x))
         u = self.layers[-1](x)
-        return u
+        return u * self.u_scale
 
 
 class DamageNetwork(nn.Module):
@@ -193,8 +195,9 @@ def compute_degradation_function(d: torch.Tensor, k: float = 1e-6) -> torch.Tens
 def compute_crack_density(d: torch.Tensor) -> torch.Tensor:
     """
     裂纹密度函数 w(d) = d^2 (AT2 模型)
+    裂纹密度函数 w(d) = d (AT1 模型)
     """
-    return d ** 2
+    return d
 
 
 # ============================================================================
@@ -202,10 +205,32 @@ def compute_crack_density(d: torch.Tensor) -> torch.Tensor:
 # ============================================================================
 
 class DRMLoss:
-    """深度Ritz方法损失函数（修正版：经典 AT2，无 history）"""
+    """深度Ritz方法损失函数（修正版：经典 AT1，无 history）"""
+
+
+    def compute_notch_loss(
+             self,
+             x_notch: torch.Tensor,
+             d_net: nn.Module,
+             d_target_value: float = 1.0,
+             weight: float = 1.0
+            ) -> torch.Tensor:
+
+        """
+        Notch constraint: enforce d(x_notch) ≈ d_target_value on the pre-crack band.
+        """
+
+        if x_notch is None or x_notch.numel() == 0:
+            return torch.tensor(0.0, device=next(d_net.parameters()).device)
+
+        d_pred = d_net(x_notch)
+        d_tgt = torch.full_like(d_pred, float(d_target_value))
+
+        return weight * torch.mean((d_pred - d_tgt) ** 2)
 
     def __init__(self, E: float, nu: float, G_c: float, l: float,
-                 c_0: float = 2 / 3, k: float = 1e-6):
+                 c_0: float = 1, k: float = 1e-5, enable_nucleation_threshold: bool = False,
+                 nucleation_threshold_tau: float = 0.0):
         """
         Args:
             E: 杨氏模量
@@ -222,6 +247,9 @@ class DRMLoss:
         self.c_0 = c_0
         self.k = k
 
+        self.enable_nucleation_threshold = enable_nucleation_threshold
+        self.nuc_tau = nucleation_threshold_tau
+
     def compute_energy_loss(
             self,
             x_domain: torch.Tensor,
@@ -230,18 +258,18 @@ class DRMLoss:
             d_prev: Optional[torch.Tensor] = None,  # ← 新增
     ) -> torch.Tensor:
         """
-        计算能量泛函损失（经典 AT2，无 history）
+        计算能量泛函损失（经典 AT1，无 history）
 
         采用张拉-压缩能量分裂：
         ψ(ε,d) = g(d)·ψ⁺(ε) + ψ⁻(ε)
 
-        总能量：
+        总能量： AT1
         E[u,d] = ∫_Ω [ψ(ε(u), d) + (G_c/c_0)(w(d)/l + l|∇d|²)] dΩ
 
         修正说明：
         - 移除了 H 参数（history 场）
         - 仅退化拉伸能量 ψ⁺，压缩能量 ψ⁻ 不退化
-        - 避免在受压区域出现非物理裂纹，是更常用的 AT2 实现
+        - 避免在受压区域出现非物理裂纹，是更常用的 AT1 实现
         """
         x_domain.requires_grad_(True)
 
@@ -249,7 +277,7 @@ class DRMLoss:
         # u = u_net(x_domain)
         # d = d_net(x_domain)
         """
-        计算 DRM 形式的总能量（AT2，无 history，但这里支持外部传入的 d_prev 做硬不可逆）
+        计算 DRM 形式的总能量（AT1，无 history，但这里支持外部传入的 d_prev 做硬不可逆）
         """
         # 1) 位移场
         u = u_net(x_domain)  # (N, 2)
@@ -260,7 +288,8 @@ class DRMLoss:
         # 3) 方案 B：如果提供了历史场，就做一次硬不可逆 clamp
         if d_prev is not None:
             # 确保在同一 device、同一形状
-            d_prev = d_prev.to(d_raw.device)
+            # 必须 detach d_prev 防止梯度回传到历史步（那是常数）
+            d_prev = d_prev.detach().to(d_raw.device)
             if d_prev.shape != d_raw.shape:
                 raise RuntimeError(
                     f"d_prev shape {d_prev.shape} != d_raw shape {d_raw.shape}"
@@ -273,6 +302,35 @@ class DRMLoss:
         epsilon = compute_strain(u, x_domain)
         psi_plus, psi_minus = compute_energy_split(epsilon, self.E, self.nu)
 
+        # # === AT1 nucleation threshold ===
+        # psi_plus_clamped = torch.clamp(psi_plus, min=0.0)
+        # threshold = self.G_c / self.l
+        #
+        # # Prevent damage when below threshold
+        # mask = (psi_plus_clamped < threshold).float()
+        #
+        # # Equivalent to d=0 region (pinning)
+        # d_effective = d * (1 - mask)
+
+        # Tanne 2018 - nucleation threshold
+        # 退化函数和裂纹密度
+
+        # 退化函数和裂纹密度
+        g_d = compute_degradation_function(d, self.k)
+        w_d = compute_crack_density(d)
+
+        ref_strain = 0.001  # 0.5% 的特征应变
+        ref_energy = 0.5 * self.E * (ref_strain ** 2)
+
+        # --- 成核阈值：只作用在“可被退化的驱动部分” ---
+        if self.enable_nucleation_threshold and (self.nuc_tau is not None) and (self.nuc_tau > 0.0):
+            tau = float(self.nuc_tau)
+            psi_drive = torch.relu(psi_plus - tau)  # 只有超过 tau 的部分才“驱动损伤”
+            psi_nodrive = psi_plus - psi_drive  # 低于 tau 的部分不退化
+            elastic_energy = (g_d * psi_drive + psi_nodrive + psi_minus)/ref_energy
+        else:
+            elastic_energy = (g_d * psi_plus + psi_minus)/ref_energy
+
         # ✅ 关键修正：仅退化拉伸能量 ψ+，保留压缩能量 ψ-
         # 经典做法：ψ(ε,d) = g(d) ψ⁺(ε) + ψ⁻(ε)
         # 这样可以避免在受压区域错误地产生或扩展裂纹
@@ -280,32 +338,15 @@ class DRMLoss:
         grad_d = compute_d_gradient(d, x_domain)
         grad_d_norm_sq = (grad_d ** 2).sum(dim=1, keepdim=True)
 
-        # 退化函数和裂纹密度
-        g_d = compute_degradation_function(d, self.k)
-        w_d = compute_crack_density(d)
-
-        # ✅ 弹性能：g(d) * ψ_plus + ψ_minus（张拉-压缩分裂，仅退化张拉部分）
-        elastic_energy = g_d * psi_plus + psi_minus
-
-        # === AT1 nucleation threshold ===
-        psi_plus_clamped = torch.clamp(psi_plus, min=0.0)
-        threshold = self.G_c / self.l
-
-        # Prevent damage when below threshold
-        mask = (psi_plus_clamped < threshold).float()
-
-        # Equivalent to d=0 region (pinning)
-        d_effective = d * (1 - mask)
-        # Tanne 2018 - nucleation threshold
+        # # ✅ 弹性能：g(d) * ψ_plus + ψ_minus（张拉-压缩分裂，仅退化张拉部分）
+        # elastic_energy = g_d * psi_plus + psi_minus
 
         # 裂纹能：(G_c/c_0) * (w(d)/l + l*|∇d|²)
-        # crack_energy = (self.G_c / self.c_0) * (w_d / self.l + self.l * grad_d_norm_sq)
-        crack_energy = self.G_c * (d_effective / self.l + self.l * grad_d_norm_sq)
+        crack_energy = (self.G_c / self.c_0) * (w_d / self.l + self.l * grad_d_norm_sq)/ref_energy
 
-        # 总能量密度
-        energy_density = elastic_energy + crack_energy
 
-        loss_energy = (elastic_energy + 0.1 * crack_energy).mean()
+
+        loss_energy = (elastic_energy + crack_energy).mean()
 
         return loss_energy
 
@@ -323,6 +364,7 @@ class DRMLoss:
         violation = torch.relu(d_prev - d_current)
         loss = weight * torch.mean(violation ** 2)
         return loss
+
 
 
 
@@ -351,7 +393,15 @@ class PhaseFieldSolver:
         self.l = problem_config['l']
 
         # 损失函数
-        self.drm_loss = DRMLoss(self.E, self.nu, self.G_c, self.l)
+        self.drm_loss = DRMLoss(
+            self.E,
+            self.nu,
+            self.G_c,
+            self.l,
+            c_0=problem_config.get("c_0", 2.0),
+            k=problem_config.get("k", 1e-6),
+            enable_nucleation_threshold=problem_config.get("enable_nucleation_threshold", True),
+            nucleation_threshold_tau=problem_config.get("nucleation_threshold_tau", 0.0))
 
         # 设备
         self.device = problem_config.get('device', 'cpu')
@@ -382,9 +432,10 @@ class PhaseFieldSolver:
     def train_step(self, x_domain: torch.Tensor, x_bc: torch.Tensor,
                    u_bc: torch.Tensor, n_epochs: int = 1000,
                    weight_bc: float = 100.0, weight_irrev: float = 0.1,  # ✅ 默认关闭不可逆性
+                   x_notch: Optional[torch.Tensor] = None,
+                   weight_notch: float = 500.0,
                    verbose: bool = True):
         """
-        单步训练（经典 AT2，无 history）
 
         Args:
             x_domain: (N, 2) 域内采样点
@@ -399,6 +450,9 @@ class PhaseFieldSolver:
         x_bc = x_bc.to(self.device)
         u_bc = u_bc.to(self.device)
 
+        if x_notch is not None:
+            x_notch = x_notch.to(self.device)
+
         self.u_net.train()
         self.d_net.train()
 
@@ -409,7 +463,7 @@ class PhaseFieldSolver:
 
             # ✅ 关键：不再传 H
             L_energy = self.drm_loss.compute_energy_loss(
-                x_domain, self.u_net, self.d_net
+                x_domain, self.u_net, self.d_net, d_prev= self.d_prev
             )
 
             L_bc = self.drm_loss.compute_bc_loss(x_bc, u_bc, self.u_net, weight_bc)
@@ -422,8 +476,15 @@ class PhaseFieldSolver:
             else:
                 L_irrev = torch.tensor(0.0, device=self.device)
 
+            # notch 约束（强烈建议：Phase-1 永远开启）
+            L_notch = self.drm_loss.compute_notch_loss(
+                x_notch = x_notch,
+                d_net = self.d_net,
+                d_target_value = 1.0,
+                weight = weight_notch
+            )
             # 总损失
-            loss = L_energy + L_bc + L_irrev
+            loss = L_energy + L_bc + L_irrev + L_notch
 
             # 反向传播
             loss.backward()

@@ -38,12 +38,12 @@ def get_output_dir():
 sys.path.insert(0, str(Path(__file__).parent))
 
 # 导入核心模块
-from phase_field_vpinn import (
+from solver_pinn import (
     DisplacementNetwork, DamageNetwork, PhaseFieldSolver,
     generate_domain_points
 )
 
-from xras_pinn_solver import (
+from solver_xras import (
     XRASPINNSolver, SubdomainModels
 )
 

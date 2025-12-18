@@ -25,7 +25,7 @@ from dataclasses import dataclass
 import os
 
 # 从原始模块导入基础组件
-from phase_field_vpinn import (
+from solver_pinn import (
     DisplacementNetwork, DamageNetwork,
     compute_strain, compute_energy_split, compute_d_gradient,
     compute_degradation_function, compute_crack_density,

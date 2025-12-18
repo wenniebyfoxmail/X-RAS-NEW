@@ -330,7 +330,7 @@ def setup_phase2_from_phase1(checkpoint_path, x_domain, config,
     load_value = step_info['load']
     
     # 4. 加载 Phase-1 的网络权重
-    from phase_field_vpinn import DisplacementNetwork, DamageNetwork
+    from solver_pinn import DisplacementNetwork, DamageNetwork
     
     u_net_phase1 = DisplacementNetwork()
     d_net_phase1 = DamageNetwork()

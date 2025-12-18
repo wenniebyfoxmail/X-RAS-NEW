@@ -25,17 +25,18 @@ from pathlib import Path
 
 # 确保模块可导入
 sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent))
 
 from config import create_config, print_config, apply_config_updates
 # 导入核心模块
-from phase_field_vpinn import (
+from solver_pinn import (
     DisplacementNetwork, DamageNetwork, PhaseFieldSolver,
     generate_domain_points
 )
 # 导入 X-RAS 求解器
-from xras_pinn_solver import XRASPINNSolver, SubdomainModels
+from solver_xras import XRASPINNSolver, SubdomainModels
 
-def run_phase1(mode="debug"):
+def run_phase1(mode="full"):
     """运行 Phase-1 实验"""
     print("\n" + "="*80)
     print(f"  实验 1: Phase-1 SENT with Notch ({mode.upper()} 模式)")
@@ -43,12 +44,14 @@ def run_phase1(mode="debug"):
 
     debug = (mode == "debug")
 
+    my_config = create_config()
+
     try:
         # 动态导入避免全局依赖
-        from test_sent_fixed import test_sent_with_notch
+        from test_sent_pinn import test_sent_with_notch
 
         t0 = time.time()
-        solver, history = test_sent_with_notch(debug=debug)
+        solver, history = test_sent_with_notch(config = my_config, debug=debug)
         t1 = time.time()
 
         print(f"\n✓ Phase-1 完成! 耗时: {t1-t0:.1f}s")
@@ -69,7 +72,7 @@ def run_phase2_baseline(mode="debug", input_updates={}, exp_name="Baseline"):
     debug = (mode == "debug")
 
     try:
-        from test_sent_phase2 import test_sent_phase2
+        from test_sent_xras import test_sent_phase2
 
         # 1. 创建基础配置
         base_config = create_config(debug=debug)

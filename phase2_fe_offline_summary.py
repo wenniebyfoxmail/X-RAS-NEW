@@ -3,10 +3,10 @@ import torch
 import numpy as np
 from pathlib import Path
 
-from phase_field_vpinn import (
+from solver_pinn import (
     DisplacementNetwork, DamageNetwork, PhaseFieldSolver
 )
-from xras_pinn_solver import XRASPINNSolver, SubdomainModels
+from solver_xras import XRASPINNSolver, SubdomainModels
 from fe_baseline_utils import (
     compute_global_L2_for_u_and_d,
     plot_fe_vs_pinn_midline,

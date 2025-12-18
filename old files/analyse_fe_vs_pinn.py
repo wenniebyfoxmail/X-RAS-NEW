@@ -19,7 +19,7 @@ project_root = current_file.parent.parent
 sys.path.insert(0, str(project_root))
 
 from config import create_config
-from phase_field_vpinn import DisplacementNetwork, DamageNetwork, generate_domain_points
+from solver_pinn import DisplacementNetwork, DamageNetwork, generate_domain_points
 from fe_baseline_utils import load_fe_2d, interpolate_fe_to_grid, plot_midline_comparison
 
 # ===========================
