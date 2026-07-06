@@ -1,0 +1,9 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.idea/
+.venv/
+venv/
+*.log
+outputs/*.pth
+outputs/*.pt
